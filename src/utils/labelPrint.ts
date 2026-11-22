@@ -1,0 +1,667 @@
+/**
+ * طباعة التكت (ستيكر الباركود) — POS مدقق
+ * ---------------------------------------------------------------------------
+ * ملف مشترك بين الواجهة والسيرفر، بدون أي مكتبة خارجية وبدون DOM:
+ *   1) رسم الباركود: EAN-13 (لو الباركود 13 رقم صحيح) وإلا Code128 — نفس ما يقرؤه قارئ البيع.
+ *      عرض الخط يُضبط على نقاط الطابعة (203 أو 300 نقطة في البوصة) حتى تخرج الخطوط حادة وتُقرأ.
+ *   2) إعدادات طابعة الباركود: الورق (رول بعدد تكت في الصف، أو A4 مقسومة)، المقاسات والهوامش،
+ *      والعناصر بالترتيب (كل عنصر: يظهر أو لا، المحاذاة، حجم الخط).
+ *   3) قراءة ملف الإكسيل: الصنف، عدد التكت، الباركود (اختياري)، تاريخ الصلاحية (اختياري).
+ *   4) بناء صفحة الطباعة HTML بالمقاس الحقيقي بالمليمتر.
+ */
+
+// ===========================================================================
+// 1) رسم الباركود
+// ===========================================================================
+
+/** عرض الخطوط والمسافات لقيم Code128 من 0 إلى 106 (106 = التوقف) */
+const CODE128_PATTERNS: readonly string[] = [
+  '212222', '222122', '222221', '121223', '121322', '131222', '122213', '122312', '132212', '221213',
+  '221312', '231212', '112232', '122132', '122231', '113222', '123122', '123221', '223211', '221132',
+  '221231', '213212', '223112', '312131', '311222', '321122', '321221', '312212', '322112', '322211',
+  '212123', '212321', '232121', '111323', '131123', '131321', '112313', '132113', '132311', '211313',
+  '231113', '231311', '112133', '112331', '132131', '113123', '113321', '133121', '313121', '211331',
+  '231131', '213113', '213311', '213131', '311123', '311321', '331121', '312113', '312311', '332111',
+  '314111', '221411', '431111', '111224', '111422', '121124', '121421', '141122', '141221', '112214',
+  '112412', '122114', '122411', '142112', '142211', '241211', '221114', '413111', '241112', '134111',
+  '111242', '121142', '121241', '114212', '124112', '124211', '411212', '421112', '421211', '212141',
+  '214121', '412121', '111143', '111341', '131141', '114113', '114311', '411113', '411311', '113141',
+  '114131', '311141', '411131', '211412', '211214', '211232', '2331112'
+];
+const START_B = 104;
+const START_C = 105;
+const SWITCH_TO_C = 99;
+const SWITCH_TO_B = 100;
+const STOP = 106;
+
+export type BarcodeType = 'auto' | 'ean13' | 'code128';
+
+export class LabelError extends Error {
+  code: 'INVALID_BARCODE';
+  constructor(message: string) {
+    super(message);
+    this.name = 'LabelError';
+    this.code = 'INVALID_BARCODE';
+  }
+}
+
+/** رقم التحقق الصحيح لأول 12 رقم في EAN-13 */
+export function ean13CheckDigit(first12: string): number {
+  let sum = 0;
+  for (let i = 0; i < 12; i++) sum += Number(first12[i]) * (i % 2 === 0 ? 1 : 3);
+  return (10 - (sum % 10)) % 10;
+}
+
+export function isValidEan13(code: string): boolean {
+  return /^\d{13}$/.test(code) && ean13CheckDigit(code.slice(0, 12)) === Number(code[12]);
+}
+
+/** القيم التي تُكتب في Code128 (بدون رقم التحقق والتوقف) */
+export function code128Values(text: string): number[] {
+  if (!text) throw new LabelError('الباركود فارغ');
+  for (const ch of text) {
+    const c = ch.charCodeAt(0);
+    if (c < 32 || c > 126) throw new LabelError(`الباركود فيه حرف لا يُطبع في الباركود: «${ch}». استخدم أرقامًا وحروفًا إنجليزية فقط`);
+  }
+  const values: number[] = [];
+  const allDigits = /^\d+$/.test(text);
+  if (allDigits && text.length >= 4) {
+    // الأرقام تُكتب كل رقمين في خانة (أقصر وأوضح على التكت الصغير)
+    let i = 0;
+    if (text.length % 2 === 1) {
+      values.push(START_B, text.charCodeAt(0) - 32, SWITCH_TO_C);
+      i = 1;
+    } else {
+      values.push(START_C);
+    }
+    for (; i < text.length; i += 2) values.push(Number(text.slice(i, i + 2)));
+    return values;
+  }
+  values.push(START_B);
+  for (const ch of text) values.push(ch.charCodeAt(0) - 32);
+  return values;
+}
+
+/** نمط الوحدات (1 = خط، 0 = مسافة) بدون الهامش الأبيض */
+export function code128Modules(text: string): string {
+  const values = code128Values(text);
+  let checksum = values[0];
+  for (let i = 1; i < values.length; i++) checksum += values[i] * i;
+  const all = [...values, checksum % 103, STOP];
+  let modules = '';
+  for (const value of all) {
+    const pattern = CODE128_PATTERNS[value];
+    for (let i = 0; i < pattern.length; i++) modules += (i % 2 === 0 ? '1' : '0').repeat(Number(pattern[i]));
+  }
+  return modules;
+}
+
+const EAN_L = ['0001101', '0011001', '0010011', '0111101', '0100011', '0110001', '0101111', '0111011', '0110111', '0001011'];
+const EAN_G = ['0100111', '0110011', '0011011', '0100001', '0011101', '0111001', '0000101', '0010001', '0001001', '0010111'];
+const EAN_R = ['1110010', '1100110', '1101100', '1000010', '1011100', '1001110', '1010000', '1000100', '1001000', '1110100'];
+const EAN_PARITY = ['LLLLLL', 'LLGLGG', 'LLGGLG', 'LLGGGL', 'LGLLGG', 'LGGLLG', 'LGGGLL', 'LGLGLG', 'LGLGGL', 'LGGLGL'];
+
+export function ean13Modules(code: string): string {
+  if (!isValidEan13(code)) throw new LabelError('باركود EAN-13 لازم يكون 13 رقم ورقم التحقق صحيح');
+  const digits = code.split('').map(Number);
+  const parity = EAN_PARITY[digits[0]];
+  let modules = '101';
+  for (let i = 1; i <= 6; i++) modules += (parity[i - 1] === 'L' ? EAN_L : EAN_G)[digits[i]];
+  modules += '01010';
+  for (let i = 7; i <= 12; i++) modules += EAN_R[digits[i]];
+  return modules + '101';
+}
+
+export interface EncodedBarcode {
+  type: 'ean13' | 'code128';
+  modules: string;
+  /** الهامش الأبيض المطلوب على كل جانب (بعدد الوحدات) */
+  quietModules: number;
+}
+
+export function encodeBarcode(raw: unknown, type: BarcodeType = 'auto'): EncodedBarcode {
+  const code = String(raw ?? '').trim();
+  if (!code) throw new LabelError('الباركود فارغ');
+  if (type === 'ean13' || (type === 'auto' && isValidEan13(code))) return { type: 'ean13', modules: ean13Modules(code), quietModules: 11 };
+  return { type: 'code128', modules: code128Modules(code), quietModules: 10 };
+}
+
+export interface BarcodeSvgOptions {
+  widthMm: number;
+  heightMm: number;
+  type?: BarcodeType;
+  /** دقة الطابعة: 203 أو 300 نقطة في البوصة */
+  printerDpi?: number;
+}
+
+export interface BarcodeSvg {
+  svg: string;
+  type: 'ean13' | 'code128';
+  /** عرض الوحدة الواحدة بالمليمتر بعد الضبط على نقاط الطابعة */
+  moduleMm: number;
+  /** العرض الفعلي للخطوط مع الهامش */
+  usedWidthMm: number;
+  /** الخطوط أرفع من نقطتين على الطابعة: قد لا تُقرأ — كبّر عرض الباركود أو قصّر الباركود */
+  tooDense: boolean;
+}
+
+/** يرسم الباركود كـ SVG بالمليمتر، وعرض الخط عدد صحيح من نقاط الطابعة */
+export function barcodeSvg(raw: unknown, options: BarcodeSvgOptions): BarcodeSvg {
+  const encoded = encodeBarcode(raw, options.type || 'auto');
+  const dotsPerMm = (options.printerDpi === 300 ? 300 : 203) / 25.4;
+  const totalModules = encoded.modules.length + encoded.quietModules * 2;
+  const availableDots = Math.max(1, Math.floor(options.widthMm * dotsPerMm));
+  const dotsPerModule = Math.max(1, Math.floor(availableDots / totalModules));
+  const moduleMm = dotsPerModule / dotsPerMm;
+  const usedWidthMm = moduleMm * totalModules;
+  let rects = '';
+  let x = encoded.quietModules;
+  let i = 0;
+  while (i < encoded.modules.length) {
+    if (encoded.modules[i] === '1') {
+      let run = 1;
+      while (encoded.modules[i + run] === '1') run++;
+      rects += `<rect x="${x + i}" y="0" width="${run}" height="1"/>`;
+      i += run;
+    } else {
+      i++;
+    }
+  }
+  const round = (n: number) => Math.round(n * 1000) / 1000;
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${round(usedWidthMm)}mm" height="${round(options.heightMm)}mm" ` +
+    `viewBox="0 0 ${totalModules} 1" preserveAspectRatio="none" shape-rendering="crispEdges" fill="#000">${rects}</svg>`;
+  return { svg, type: encoded.type, moduleMm: round(moduleMm), usedWidthMm: round(usedWidthMm), tooDense: dotsPerModule < 2 };
+}
+
+// ===========================================================================
+// 2) إعدادات طابعة الباركود
+// ===========================================================================
+
+export type LabelElementKey = 'shopName' | 'logo' | 'itemName' | 'barcode' | 'barcodeText' | 'price' | 'unit' | 'expiry';
+export type LabelAlign = 'right' | 'center' | 'left';
+
+export interface LabelElement {
+  key: LabelElementKey;
+  show: boolean;
+  align: LabelAlign;
+  /** حجم الخط بالنقطة (pt). لا يُستخدم مع الباركود والشعار */
+  fontSizePt: number;
+  bold: boolean;
+}
+
+export interface LabelSettings {
+  paper: 'roll' | 'a4';
+  /** مقاس التكت الواحدة بالمليمتر */
+  labelWidthMm: number;
+  labelHeightMm: number;
+  /** رول: عدد التكت في الصف (ورق مقسوم على اثنين = 2) */
+  columns: number;
+  /** A4: عدد الصفوف في الصفحة */
+  rows: number;
+  /** المسافة بين التكت بالمليمتر */
+  gapXMm: number;
+  gapYMm: number;
+  /** هوامش داخل كل تكت */
+  labelMargin: { top: number; bottom: number; right: number; left: number };
+  /** هوامش الصفحة (الرول أو ورقة A4) */
+  pageMargin: { top: number; bottom: number; right: number; left: number };
+  barcodeWidthMm: number;
+  barcodeHeightMm: number;
+  barcodeType: BarcodeType;
+  printerDpi: 203 | 300;
+  logoWidthMm: number;
+  logoHeightMm: number;
+  /** نص اسم المحل أو الفرع (فارغ = اسم المنشأة) */
+  shopNameText: string;
+  /** مصدر اسم الصنف: اسم الصنف، اسم الطباعة (ولو فارغ اسم الصنف)، أو وصف الصنف */
+  itemNameSource: 'name' | 'printName' | 'description';
+  /** العناصر بالترتيب من أعلى لأسفل */
+  elements: LabelElement[];
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export const LABEL_ELEMENT_LABELS: Readonly<Record<LabelElementKey, string>> = {
+  shopName: 'اسم المحل أو الفرع',
+  logo: 'شعار المحل',
+  itemName: 'اسم الصنف',
+  barcode: 'خطوط الباركود',
+  barcodeText: 'رقم الباركود',
+  price: 'سعر البيع',
+  unit: 'الوحدة',
+  expiry: 'تاريخ الصلاحية'
+};
+
+/** مقاسات جاهزة للتكت (العرض × الارتفاع بالمليمتر) */
+export const LABEL_SIZE_PRESETS: readonly { widthMm: number; heightMm: number }[] = [
+  { widthMm: 40, heightMm: 25 },
+  { widthMm: 38, heightMm: 25 },
+  { widthMm: 40, heightMm: 30 },
+  { widthMm: 50, heightMm: 25 },
+  { widthMm: 50, heightMm: 30 },
+  { widthMm: 58, heightMm: 40 }
+];
+
+const ELEMENT_KEYS: readonly LabelElementKey[] = ['shopName', 'logo', 'itemName', 'barcode', 'barcodeText', 'price', 'unit', 'expiry'];
+
+export function defaultLabelSettings(): LabelSettings {
+  return {
+    paper: 'roll',
+    labelWidthMm: 40,
+    labelHeightMm: 25,
+    columns: 1,
+    rows: 10,
+    gapXMm: 2,
+    gapYMm: 0,
+    labelMargin: { top: 1, bottom: 1, right: 1, left: 1 },
+    pageMargin: { top: 0, bottom: 0, right: 0, left: 0 },
+    barcodeWidthMm: 38,
+    barcodeHeightMm: 10,
+    barcodeType: 'auto',
+    printerDpi: 203,
+    logoWidthMm: 10,
+    logoHeightMm: 5,
+    shopNameText: '',
+    itemNameSource: 'printName',
+    elements: [
+      { key: 'shopName', show: true, align: 'center', fontSizePt: 6, bold: true },
+      { key: 'logo', show: false, align: 'center', fontSizePt: 0, bold: false },
+      { key: 'itemName', show: true, align: 'center', fontSizePt: 7, bold: false },
+      { key: 'barcode', show: true, align: 'center', fontSizePt: 0, bold: false },
+      { key: 'barcodeText', show: true, align: 'center', fontSizePt: 6, bold: false },
+      { key: 'price', show: true, align: 'center', fontSizePt: 8, bold: true },
+      { key: 'unit', show: false, align: 'center', fontSizePt: 6, bold: false },
+      { key: 'expiry', show: false, align: 'center', fontSizePt: 6, bold: false }
+    ],
+    updatedAt: '',
+    updatedBy: ''
+  };
+}
+
+const num = (value: unknown, min: number, max: number, fallback: number) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n * 100) / 100)) : fallback;
+};
+const oneOf = <T extends string>(value: unknown, allowed: readonly T[], fallback: T): T => (allowed.includes(value as T) ? (value as T) : fallback);
+const margins = (value: any, fallback: LabelSettings['labelMargin'], max: number) => ({
+  top: num(value?.top, 0, max, fallback.top),
+  bottom: num(value?.bottom, 0, max, fallback.bottom),
+  right: num(value?.right, 0, max, fallback.right),
+  left: num(value?.left, 0, max, fallback.left)
+});
+
+/** ينظف أي إعدادات مرسلة أو محفوظة (القيم الغلط ترجع للافتراضي) */
+export function normalizeLabelSettings(value: unknown): LabelSettings {
+  const base = defaultLabelSettings();
+  const s: any = value && typeof value === 'object' ? value : {};
+  const paper = oneOf(s.paper, ['roll', 'a4'] as const, base.paper);
+  const labelWidthMm = num(s.labelWidthMm, 15, 150, base.labelWidthMm);
+  const labelHeightMm = num(s.labelHeightMm, 10, 150, base.labelHeightMm);
+  const seen = new Set<LabelElementKey>();
+  const elements: LabelElement[] = [];
+  if (Array.isArray(s.elements)) {
+    for (const raw of s.elements) {
+      const key = raw?.key as LabelElementKey;
+      if (!ELEMENT_KEYS.includes(key) || seen.has(key)) continue;
+      seen.add(key);
+      const def = base.elements.find(e => e.key === key)!;
+      elements.push({
+        key,
+        show: typeof raw.show === 'boolean' ? raw.show : def.show,
+        align: oneOf(raw.align, ['right', 'center', 'left'] as const, def.align),
+        fontSizePt: key === 'barcode' || key === 'logo' ? 0 : num(raw.fontSizePt, 4, 24, def.fontSizePt || 6),
+        bold: Boolean(raw.bold)
+      });
+    }
+  }
+  // العناصر الناقصة تُضاف في آخر الترتيب بإعداداتها الافتراضية
+  for (const def of base.elements) if (!seen.has(def.key)) elements.push({ ...def });
+  return {
+    paper,
+    labelWidthMm,
+    labelHeightMm,
+    columns: paper === 'roll' ? Math.round(num(s.columns, 1, 4, base.columns)) : Math.round(num(s.columns, 1, 8, 3)),
+    rows: Math.round(num(s.rows, 1, 30, base.rows)),
+    gapXMm: num(s.gapXMm, 0, 20, base.gapXMm),
+    gapYMm: num(s.gapYMm, 0, 20, base.gapYMm),
+    labelMargin: margins(s.labelMargin, base.labelMargin, 10),
+    pageMargin: margins(s.pageMargin, base.pageMargin, 30),
+    barcodeWidthMm: Math.min(num(s.barcodeWidthMm, 10, 150, base.barcodeWidthMm), labelWidthMm),
+    barcodeHeightMm: Math.min(num(s.barcodeHeightMm, 3, 100, base.barcodeHeightMm), labelHeightMm),
+    barcodeType: oneOf(s.barcodeType, ['auto', 'ean13', 'code128'] as const, base.barcodeType),
+    printerDpi: Number(s.printerDpi) === 300 ? 300 : 203,
+    logoWidthMm: num(s.logoWidthMm, 2, 60, base.logoWidthMm),
+    logoHeightMm: num(s.logoHeightMm, 2, 40, base.logoHeightMm),
+    shopNameText: String(s.shopNameText ?? '').trim().slice(0, 60),
+    itemNameSource: oneOf(s.itemNameSource, ['name', 'printName', 'description'] as const, base.itemNameSource),
+    elements,
+    updatedAt: String(s.updatedAt || ''),
+    updatedBy: String(s.updatedBy || '')
+  };
+}
+
+/** أخطاء الإعدادات التي تمنع الحفظ (رسائل عربية)، أو قائمة فارغة */
+export function validateLabelSettings(value: unknown): string[] {
+  const s: any = value && typeof value === 'object' ? value : null;
+  if (!s) return ['بيانات الإعدادات غير صالحة'];
+  const errors: string[] = [];
+  const check = (field: string, label: string, min: number, max: number) => {
+    if (s[field] === undefined) return;
+    const n = Number(s[field]);
+    if (!Number.isFinite(n) || n < min || n > max) errors.push(`«${label}» لازم تكون من ${min} إلى ${max}`);
+  };
+  check('labelWidthMm', 'عرض التكت', 15, 150);
+  check('labelHeightMm', 'ارتفاع التكت', 10, 150);
+  check('barcodeWidthMm', 'عرض الباركود', 10, 150);
+  check('barcodeHeightMm', 'ارتفاع الباركود', 3, 100);
+  check('columns', 'عدد التكت في الصف', 1, s.paper === 'a4' ? 8 : 4);
+  check('rows', 'عدد الصفوف في الصفحة', 1, 30);
+  if (s.paper !== undefined && !['roll', 'a4'].includes(s.paper)) errors.push('نوع الورق غير صحيح');
+  if (Number(s.barcodeWidthMm) > Number(s.labelWidthMm)) errors.push('عرض الباركود أكبر من عرض التكت');
+  if (Number(s.barcodeHeightMm) > Number(s.labelHeightMm)) errors.push('ارتفاع الباركود أكبر من ارتفاع التكت');
+  return errors;
+}
+
+// ===========================================================================
+// 3) سطور الطباعة وقراءة ملف الإكسيل
+// ===========================================================================
+
+export interface LabelItem {
+  id: string;
+  name: string;
+  printName?: string;
+  notes?: string;
+  barcode?: string;
+  secondaryBarcodes?: string[];
+  barcodes?: { barcode: string; active?: boolean }[];
+  salePrice: number;
+  taxRate?: number;
+  unit?: string;
+  status?: string;
+}
+
+export interface LabelLine {
+  itemId: string;
+  barcode: string;
+  count: number;
+  /** YYYY-MM-DD أو فارغ */
+  expiry: string;
+  /** الباركود ليس من باركودات الصنف: لو اتضرب في البيع لن يُعرف الصنف */
+  unregisteredBarcode: boolean;
+}
+
+export const MAX_LABELS_PER_PRINT = 5000;
+export const MAX_COUNT_PER_LINE = 1000;
+
+const normalizeCode = (value: unknown) => String(value ?? '').trim().replace(/\s+/g, '');
+const normalizeName = (value: unknown) =>
+  String(value ?? '')
+    .trim()
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+const isActive = (item: LabelItem) => !['inactive', 'موقوف', 'مؤرشف'].includes(String(item.status ?? ''));
+
+/** كل باركودات الصنف: الأساسي أولًا ثم الفرعية */
+export function itemBarcodeList(item: LabelItem): string[] {
+  const list: unknown[] = [item.barcode, ...(item.secondaryBarcodes || [])];
+  for (const b of item.barcodes || []) if (b && b.active !== false) list.push(b.barcode);
+  return Array.from(new Set(list.map(normalizeCode).filter(Boolean)));
+}
+
+/** الباركود الافتراضي للسطر = الباركود الأساسي للصنف (أو أول باركود متاح) */
+export function defaultBarcodeFor(item: LabelItem): string {
+  return itemBarcodeList(item)[0] || '';
+}
+
+/** يقرأ تاريخ الصلاحية: 2026-12-31 أو 31/12/2026 أو رقم تاريخ الإكسيل. يرجع YYYY-MM-DD أو null لو غلط */
+export function parseExpiry(value: unknown): string | null {
+  if (value === undefined || value === null || String(value).trim() === '') return '';
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().slice(0, 10);
+  const text = String(value).trim();
+  let y = 0;
+  let m = 0;
+  let d = 0;
+  let match: RegExpExecArray | null;
+  if ((match = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/.exec(text))) {
+    y = +match[1];
+    m = +match[2];
+    d = +match[3];
+  } else if ((match = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$/.exec(text))) {
+    d = +match[1];
+    m = +match[2];
+    y = +match[3];
+  } else if (/^\d{5}(\.\d+)?$/.test(text)) {
+    // رقم تاريخ الإكسيل (عدد الأيام من 1899-12-30)
+    const date = new Date(Date.UTC(1899, 11, 30) + Math.floor(Number(text)) * 86400000);
+    return date.toISOString().slice(0, 10);
+  } else {
+    return null;
+  }
+  const date = new Date(Date.UTC(y, m - 1, d));
+  if (date.getUTCFullYear() !== y || date.getUTCMonth() !== m - 1 || date.getUTCDate() !== d || y < 2000 || y > 2100) return null;
+  return date.toISOString().slice(0, 10);
+}
+
+export interface ParsedLabelSheet {
+  lines: LabelLine[];
+  errors: { row: number; message: string }[];
+  warnings: { row: number; message: string }[];
+  totalLabels: number;
+}
+
+/**
+ * يقرأ صفوف الإكسيل (مصفوفة صفوف، كل صف مصفوفة خانات):
+ * العمود 1 الصنف (اسمه أو اسم الطباعة أو أي باركود له)، العمود 2 عدد التكت،
+ * العمود 3 الباركود (اختياري)، العمود 4 تاريخ الصلاحية (اختياري). صف العناوين يُتخطى تلقائيًا.
+ */
+export function parseLabelSheet(rows: unknown[][], items: LabelItem[]): ParsedLabelSheet {
+  const active = items.filter(isActive);
+  const byBarcode = new Map<string, LabelItem[]>();
+  const byName = new Map<string, LabelItem[]>();
+  const add = (map: Map<string, LabelItem[]>, key: string, item: LabelItem) => {
+    if (!key) return;
+    const list = map.get(key) || [];
+    if (!list.includes(item)) list.push(item);
+    map.set(key, list);
+  };
+  for (const item of active) {
+    for (const code of itemBarcodeList(item)) add(byBarcode, code.toUpperCase(), item);
+    add(byName, normalizeName(item.name), item);
+    if (item.printName) add(byName, normalizeName(item.printName), item);
+  }
+  const allByBarcode = new Map<string, LabelItem>();
+  for (const item of items) for (const code of itemBarcodeList(item)) if (!allByBarcode.has(code.toUpperCase())) allByBarcode.set(code.toUpperCase(), item);
+
+  const result: ParsedLabelSheet = { lines: [], errors: [], warnings: [], totalLabels: 0 };
+  rows.forEach((row, index) => {
+    const rowNumber = index + 1;
+    const cells = Array.isArray(row) ? row : [];
+    const first = String(cells[0] ?? '').trim();
+    if (!first && cells.every(c => String(c ?? '').trim() === '')) return;
+    if (index === 0 && /الصنف|اسم/.test(first) && !Number.isFinite(Number(cells[1]))) return;
+    if (!first) {
+      result.errors.push({ row: rowNumber, message: 'اسم الصنف أو الباركود فارغ' });
+      return;
+    }
+    const matches = byBarcode.get(normalizeCode(first).toUpperCase()) || byName.get(normalizeName(first)) || [];
+    if (matches.length === 0) {
+      result.errors.push({ row: rowNumber, message: `الصنف «${first}» غير موجود` });
+      return;
+    }
+    if (matches.length > 1) {
+      result.errors.push({ row: rowNumber, message: `الاسم «${first}» لأكثر من صنف. اكتب الباركود بدل الاسم` });
+      return;
+    }
+    const item = matches[0];
+    const countRaw = String(cells[1] ?? '').trim();
+    const count = Number(countRaw);
+    if (!countRaw || !Number.isInteger(count) || count < 1 || count > MAX_COUNT_PER_LINE) {
+      result.errors.push({ row: rowNumber, message: `عدد التكت لازم يكون رقمًا صحيحًا من 1 إلى ${MAX_COUNT_PER_LINE}` });
+      return;
+    }
+    let barcode = normalizeCode(cells[2]);
+    let unregisteredBarcode = false;
+    if (!barcode) {
+      barcode = defaultBarcodeFor(item);
+      if (!barcode) {
+        result.errors.push({ row: rowNumber, message: `الصنف «${item.name}» ليس له باركود. اكتب الباركود في العمود الثالث` });
+        return;
+      }
+    } else {
+      const owner = allByBarcode.get(barcode.toUpperCase());
+      if (owner && owner.id !== item.id) {
+        result.errors.push({ row: rowNumber, message: `الباركود ${barcode} مسجل على صنف آخر: «${owner.name}»` });
+        return;
+      }
+      if (!owner) unregisteredBarcode = true;
+    }
+    try {
+      encodeBarcode(barcode, 'auto');
+    } catch (err: any) {
+      result.errors.push({ row: rowNumber, message: err?.message || 'الباركود لا يمكن طباعته' });
+      return;
+    }
+    const expiry = parseExpiry(cells[3]);
+    if (expiry === null) {
+      result.errors.push({ row: rowNumber, message: 'تاريخ الصلاحية غير صحيح. اكتبه مثل 31/12/2026' });
+      return;
+    }
+    // التحذير بعد التأكد أن السطر سيُطبع فعلًا
+    if (unregisteredBarcode) {
+      result.warnings.push({ row: rowNumber, message: `الباركود ${barcode} غير مسجل على الصنف «${item.name}»: لو اتضرب في البيع لن يُعرف الصنف` });
+    }
+    result.lines.push({ itemId: item.id, barcode, count, expiry, unregisteredBarcode });
+    result.totalLabels += count;
+  });
+  if (result.totalLabels > MAX_LABELS_PER_PRINT) {
+    result.errors.push({ row: 0, message: `إجمالي التكت ${result.totalLabels} أكبر من الحد الأقصى ${MAX_LABELS_PER_PRINT} في المرة الواحدة. قسّم الملف` });
+  }
+  return result;
+}
+
+// ===========================================================================
+// 4) بناء صفحة الطباعة
+// ===========================================================================
+
+export interface LabelPrintContext {
+  items: LabelItem[];
+  /** اسم المنشأة (يُستخدم لو اسم المحل في الإعدادات فارغ) */
+  companyName: string;
+  logoUrl: string;
+  /** هل أسعار البيع شاملة الضريبة؟ */
+  taxInclusive: boolean;
+}
+
+const escapeHtml = (value: unknown) =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
+/** السعر على التكت = السعر الذي يدفعه الزبون (بالضريبة لو الأسعار غير شاملة) */
+export function labelPrice(item: LabelItem, taxInclusive: boolean): number {
+  const base = Number(item.salePrice) || 0;
+  const rate = Number(item.taxRate) || 0;
+  const price = taxInclusive || rate <= 0 ? base : base * (1 + rate / 100);
+  return Math.round(price * 100) / 100;
+}
+
+export function labelItemName(item: LabelItem, source: LabelSettings['itemNameSource']): string {
+  if (source === 'description') return String(item.notes || '').trim() || item.name;
+  if (source === 'printName') return String(item.printName || '').trim() || item.name;
+  return item.name;
+}
+
+const formatExpiry = (iso: string) => (iso ? `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)}` : '');
+
+/** محتوى تكت واحدة (HTML) */
+export function renderLabel(line: LabelLine, settings: LabelSettings, context: LabelPrintContext): string {
+  const item = context.items.find(i => i.id === line.itemId);
+  if (!item) return '';
+  const parts: string[] = [];
+  for (const el of settings.elements) {
+    if (!el.show) continue;
+    const style = `text-align:${el.align};font-size:${el.fontSizePt}pt;font-weight:${el.bold ? 700 : 400}`;
+    const justify = el.align === 'right' ? 'flex-start' : el.align === 'left' ? 'flex-end' : 'center';
+    if (el.key === 'barcode') {
+      const bc = barcodeSvg(line.barcode, { widthMm: settings.barcodeWidthMm, heightMm: settings.barcodeHeightMm, type: settings.barcodeType, printerDpi: settings.printerDpi });
+      parts.push(`<div class="lb-bar" style="justify-content:${justify}">${bc.svg}</div>`);
+    } else if (el.key === 'logo') {
+      if (!context.logoUrl) continue;
+      parts.push(`<div class="lb-logo" style="justify-content:${justify}"><img src="${escapeHtml(context.logoUrl)}" style="max-width:${settings.logoWidthMm}mm;max-height:${settings.logoHeightMm}mm" alt=""></div>`);
+    } else {
+      let text = '';
+      if (el.key === 'shopName') text = settings.shopNameText || context.companyName;
+      else if (el.key === 'itemName') text = labelItemName(item, settings.itemNameSource);
+      else if (el.key === 'barcodeText') text = line.barcode;
+      else if (el.key === 'price') text = `${labelPrice(item, context.taxInclusive).toFixed(2)} ج.م`;
+      else if (el.key === 'unit') text = item.unit || '';
+      else if (el.key === 'expiry') text = line.expiry ? `صلاحية: ${formatExpiry(line.expiry)}` : '';
+      if (!text) continue;
+      const extra = el.key === 'itemName' ? ' lb-clamp' : '';
+      const dir = el.key === 'barcodeText' ? ' dir="ltr"' : '';
+      parts.push(`<div class="lb-text${extra}" style="${style}"${dir}>${escapeHtml(text)}</div>`);
+    }
+  }
+  return parts.join('');
+}
+
+export interface LabelPrintJob {
+  html: string;
+  /** عدد التكت الكلي */
+  totalLabels: number;
+  /** عدد الصفحات (رول: كل صف = صفحة) */
+  pages: number;
+  /** أكواد خطوطها أرفع من اللازم على هذه الطابعة */
+  denseBarcodes: string[];
+}
+
+/** صفحة الطباعة كاملة بالمقاس الحقيقي. تُفتح في نافذة أو iframe ثم window.print() */
+export function buildLabelPrintHtml(lines: LabelLine[], settingsInput: LabelSettings, context: LabelPrintContext): LabelPrintJob {
+  const settings = normalizeLabelSettings(settingsInput);
+  const expanded: LabelLine[] = [];
+  for (const line of lines) for (let i = 0; i < Math.max(0, Math.floor(line.count)); i++) expanded.push(line);
+  if (expanded.length > MAX_LABELS_PER_PRINT) expanded.length = MAX_LABELS_PER_PRINT;
+  const dense = new Set<string>();
+  for (const line of lines) {
+    try {
+      if (barcodeSvg(line.barcode, { widthMm: settings.barcodeWidthMm, heightMm: settings.barcodeHeightMm, type: settings.barcodeType, printerDpi: settings.printerDpi }).tooDense) dense.add(line.barcode);
+    } catch {
+      // الباركود غير الصالح يظهر خطؤه في الشاشة قبل الطباعة
+    }
+  }
+  const { columns, gapXMm, gapYMm, labelWidthMm: w, labelHeightMm: h } = settings;
+  const pm = settings.pageMargin;
+  const lm = settings.labelMargin;
+  const perPage = settings.paper === 'roll' ? columns : columns * settings.rows;
+  const pageWidthMm = settings.paper === 'roll' ? pm.left + pm.right + columns * w + (columns - 1) * gapXMm : 210;
+  const pageHeightMm = settings.paper === 'roll' ? pm.top + pm.bottom + h : 297;
+  const pages: string[] = [];
+  for (let start = 0; start < expanded.length; start += perPage) {
+    const cells = expanded
+      .slice(start, start + perPage)
+      .map(line => `<div class="lb">${renderLabel(line, settings, context)}</div>`)
+      .join('');
+    pages.push(`<div class="pg">${cells}</div>`);
+  }
+  const css = `
+@page { size: ${pageWidthMm}mm ${pageHeightMm}mm; margin: 0; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: #fff; color: #000; font-family: Tahoma, 'Cairo', Arial, sans-serif; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+.pg { width: ${pageWidthMm}mm; ${settings.paper === 'roll' ? `height: ${pageHeightMm}mm;` : ''} padding: ${pm.top}mm ${pm.right}mm ${pm.bottom}mm ${pm.left}mm; display: grid; grid-template-columns: repeat(${columns}, ${w}mm); grid-auto-rows: ${h}mm; column-gap: ${gapXMm}mm; row-gap: ${gapYMm}mm; direction: rtl; page-break-after: always; break-after: page; overflow: hidden; }
+.pg:last-child { page-break-after: auto; break-after: auto; }
+.lb { width: ${w}mm; height: ${h}mm; padding: ${lm.top}mm ${lm.right}mm ${lm.bottom}mm ${lm.left}mm; display: flex; flex-direction: column; justify-content: center; gap: 0.3mm; overflow: hidden; direction: rtl; }
+.lb-text { line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: clip; }
+.lb-clamp { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.lb-bar, .lb-logo { display: flex; direction: ltr; }
+.lb-bar svg { display: block; }
+.lb-logo img { display: block; object-fit: contain; }
+`;
+  const html = `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>طباعة التكت</title><style>${css}</style></head><body>${pages.join('')}</body></html>`;
+  return { html, totalLabels: expanded.length, pages: pages.length, denseBarcodes: Array.from(dense) };
+}

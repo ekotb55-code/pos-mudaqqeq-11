@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#0891b2" />
+    </linearGradient>
+    <linearGradient id="tealGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#06b6d4" />
+      <stop offset="100%" stop-color="#0e7490" />
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Background rounded squircle -->
+  <rect width="512" height="512" rx="112" fill="url(#bgGrad)"/>
+
+  <!-- Subtle glow inner circle -->
+  <circle cx="256" cy="256" r="210" fill="none" stroke="#38bdf8" stroke-width="4" stroke-opacity="0.25"/>
+
+  <!-- Central POS Screen / Terminal Card -->
+  <g filter="url(#shadow)">
+    <rect x="96" y="112" width="320" height="288" rx="28" fill="#1e293b" stroke="#334155" stroke-width="4"/>
+    
+    <!-- Header Screen Bar -->
+    <path d="M96 140 C96 124.5 108.5 112 124 112 L388 112 C403.5 112 416 124.5 416 140 L416 170 L96 170 Z" fill="#0e7490"/>
+    
+    <!-- Three dots on screen -->
+    <circle cx="128" cy="141" r="5" fill="#f87171"/>
+    <circle cx="146" cy="141" r="5" fill="#fbbf24"/>
+    <circle cx="164" cy="141" r="5" fill="#34d399"/>
+    
+    <!-- Audit Check Shield Badge -->
+    <path d="M358 132 L372 138 C372 152 364 162 358 165 C352 162 344 152 344 138 Z" fill="#38bdf8"/>
+    <path d="M352 148 L356 152 L364 144" stroke="#0f172a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+
+    <!-- Barcode and Scan Lines -->
+    <g transform="translate(136, 196)">
+      <!-- Barcode stripes -->
+      <rect x="0" y="0" width="8" height="52" rx="2" fill="#e2e8f0"/>
+      <rect x="14" y="0" width="4" height="52" rx="1" fill="#94a3b8"/>
+      <rect x="24" y="0" width="12" height="52" rx="2" fill="#e2e8f0"/>
+      <rect x="42" y="0" width="6" height="52" rx="2" fill="#94a3b8"/>
+      <rect x="54" y="0" width="16" height="52" rx="2" fill="#e2e8f0"/>
+      <rect x="76" y="0" width="6" height="52" rx="2" fill="#94a3b8"/>
+      <rect x="88" y="0" width="10" height="52" rx="2" fill="#e2e8f0"/>
+      <rect x="104" y="0" width="4" height="52" rx="1" fill="#94a3b8"/>
+      <rect x="114" y="0" width="14" height="52" rx="2" fill="#e2e8f0"/>
+      <rect x="134" y="0" width="6" height="52" rx="2" fill="#38bdf8"/>
+      <rect x="146" y="0" width="10" height="52" rx="2" fill="#e2e8f0"/>
+      <rect x="162" y="0" width="4" height="52" rx="1" fill="#94a3b8"/>
+      <rect x="172" y="0" width="16" height="52" rx="2" fill="#e2e8f0"/>
+      <rect x="194" y="0" width="8" height="52" rx="2" fill="#e2e8f0"/>
+      <rect x="208" y="0" width="4" height="52" rx="1" fill="#94a3b8"/>
+      <rect x="218" y="0" width="12" height="52" rx="2" fill="#e2e8f0"/>
+      <rect x="236" y="0" width="4" height="52" rx="1" fill="#38bdf8"/>
+
+      <!-- Laser scan red line with pulse -->
+      <line x1="-12" y1="26" x2="252" y2="26" stroke="#f43f5e" stroke-width="3" stroke-linecap="round"/>
+      <circle cx="120" cy="26" r="6" fill="#f43f5e" opacity="0.6"/>
+    </g>
+
+    <!-- Shopping cart and platform tags -->
+    <g transform="translate(136, 276)">
+      <!-- Platform Pills -->
+      <rect x="0" y="0" width="52" height="24" rx="6" fill="#f59e0b" fill-opacity="0.2"/>
+      <text x="26" y="16" fill="#fbbf24" font-size="11" font-weight="bold" font-family="sans-serif" text-anchor="middle">AMZ</text>
+
+      <rect x="60" y="0" width="52" height="24" rx="6" fill="#f97316" fill-opacity="0.2"/>
+      <text x="86" y="16" fill="#fb923c" font-size="11" font-weight="bold" font-family="sans-serif" text-anchor="middle">JUM</text>
+
+      <rect x="120" y="0" width="52" height="24" rx="6" fill="#3b82f6" fill-opacity="0.2"/>
+      <text x="146" y="16" fill="#60a5fa" font-size="11" font-weight="bold" font-family="sans-serif" text-anchor="middle">BTECH</text>
+
+      <rect x="180" y="0" width="60" height="24" rx="6" fill="#eab308" fill-opacity="0.2"/>
+      <text x="210" y="16" fill="#fde047" font-size="11" font-weight="bold" font-family="sans-serif" text-anchor="middle">NOON</text>
+
+      <!-- Cart Icon / Total bar -->
+      <rect x="0" y="44" width="240" height="46" rx="10" fill="#0f172a" stroke="#334155" stroke-width="2"/>
+      
+      <!-- Cart SVG path inside -->
+      <path d="M22 66 L30 66 L38 80 L56 80 L62 70 L34 70" fill="none" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="40" cy="84" r="2.5" fill="#38bdf8"/>
+      <circle cx="54" cy="84" r="2.5" fill="#38bdf8"/>
+
+      <!-- Total Text -->
+      <text x="220" y="72" fill="#22c55e" font-size="16" font-weight="bold" font-family="sans-serif" text-anchor="end">EGP 2,450</text>
+      <text x="80" y="72" fill="#94a3b8" font-size="12" font-family="sans-serif">POS مدقق</text>
+    </g>
+  </g>
+
+  <!-- POS Stand Base -->
+  <path d="M216 400 L296 400 L320 440 L192 440 Z" fill="#334155"/>
+  <rect x="160" y="440" width="192" height="14" rx="7" fill="#475569"/>
+</svg>
