@@ -835,7 +835,11 @@ export async function createServerApp(options?: { attachVite?: boolean; persiste
   const app = express();
   const httpServer = http.createServer(app);
   // منفذ 3000 الإلزامي للعمل داخل بيئة AI Studio iFrame
-  const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
+
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  throw new Error(`قيمة PORT غير صالحة: ${process.env.PORT}`);
+}
 
   // ترويسات الأمان عبر helmet بإعدادات متوافقة مع iFrame والواجهة والخطوط والطباعة
   app.set('trust proxy', 1);
