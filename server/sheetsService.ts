@@ -16974,7 +16974,10 @@ export async function getCashboxes(session?: { token?: string }): Promise<Cashbo
 /**
  * حفظ أو إضافة خزينة
  */
-export async function saveCashbox(cashbox: Partial<Cashbox> & { name: string }, session?: { token?: string }): Promise<{ success: boolean; cashbox?: Cashbox; error?: string; code?: string }> {
+export async function saveCashbox(
+  cashbox: Partial<Cashbox> & { name: string },
+  session?: { token?: string; userId?: string; name?: string; role?: string; phone?: string }
+): Promise<{ success: boolean; cashbox?: Cashbox; error?: string; code?: string }> {
   const config = getSystemConfig();
   if (isSheetsDataMode(config)) {
     const res: any = await callAppsScript('saveCashbox', cashbox, session?.token);
@@ -16988,12 +16991,54 @@ export async function saveCashbox(cashbox: Partial<Cashbox> & { name: string }, 
   if (isEdit) {
     const idx = memoryCashboxes.findIndex(c => c.id === cashbox.id);
     if (idx === -1) return { success: false, error: 'الخزينة غير مسجلة' };
+    const old = memoryCashboxes[idx];
+    const oldOpening = Math.round(Number(old.openingBalance || 0) * 100) / 100;
+    const newOpening =
+      cashbox.openingBalance === undefined || cashbox.openingBalance === null || String(cashbox.openingBalance).trim() === ''
+        ? oldOpening
+        : Math.round(Number(cashbox.openingBalance) * 100) / 100;
+    if (!Number.isFinite(newOpening)) return { success: false, error: 'الرصيد الافتتاحي لازم يكون رقم' };
+
+    // التعديل بيقبل بيانات الخزنة بس. الرصيد الحالي ما يتاخدش من الطلب أبدًا: بيتغير بحركات بس
     saved = {
-      ...memoryCashboxes[idx],
-      ...cashbox,
-      name: cashbox.name.trim()
+      ...old,
+      name: cashbox.name.trim(),
+      ...(cashbox.type !== undefined ? { type: cashbox.type } : {}),
+      ...(cashbox.currency !== undefined ? { currency: cashbox.currency } : {}),
+      ...(cashbox.responsibleUserName !== undefined ? { responsibleUserName: cashbox.responsibleUserName } : {}),
+      ...(cashbox.status !== undefined ? { status: cashbox.status } : {}),
+      ...(cashbox.notes !== undefined ? { notes: cashbox.notes } : {})
     };
+
+    // تعديل الرصيد الافتتاحي (من شاشة الخزن): حركة ظاهرة بالفرق، علشان مجموع الحركات يفضل = الرصيد
+    const delta = Math.round((newOpening - oldOpening) * 100) / 100;
+    const actor = session?.name || session?.phone || 'المسؤول';
+    if (delta !== 0) {
+      saved.openingBalance = newOpening;
+      saved.currentBalance = Math.round((Number(old.currentBalance || 0) + delta) * 100) / 100;
+      memoryCashboxTransactions.push({
+        id: generateUUID(),
+        date: new Date().toISOString(),
+        cashboxId: saved.id,
+        cashboxName: saved.name,
+        type: delta > 0 ? 'إيداع' : 'سحب',
+        documentNumber: `OPN-ADJ-${saved.id}-${Date.now().toString(36)}`,
+        amount: delta,
+        balanceAfter: saved.currentBalance,
+        statement: `تعديل الرصيد الافتتاحي من ${oldOpening} إلى ${newOpening} ج.م`,
+        userName: actor
+      });
+    }
     memoryCashboxes[idx] = saved;
+    recordAuditLog(
+      { id: session?.userId, name: session?.name, role: session?.role, phone: session?.phone },
+      'CASHBOX_EDIT',
+      'Cashbox',
+      saved.id,
+      `تعديل الخزنة «${old.name}»${old.name !== saved.name ? ` ← «${saved.name}»` : ''}${
+        delta !== 0 ? ` — الرصيد الافتتاحي من ${oldOpening} إلى ${newOpening} ج.م (حركة بالفرق ${delta} ج.م)` : ''
+      }`
+    );
   } else {
     const opening = Number(cashbox.openingBalance || 0);
     saved = {

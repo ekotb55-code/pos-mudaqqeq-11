@@ -4974,7 +4974,8 @@ export async function createServerApp(options?: { attachVite?: boolean; persiste
 
   app.post('/api/cashboxes', requireFullMode as any, requirePermission('cashbox.create') as any, async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const result = await saveCashbox(req.body, { token: req.authToken });
+      const s = req.userSession!;
+      const result = await saveCashbox(req.body, { token: req.authToken, userId: s.userId, name: s.name, role: s.role, phone: s.phone });
       sendWriteResult(res, result);
     } catch (err: any) {
       handleCatchError(res, err);
