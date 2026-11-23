@@ -131,6 +131,7 @@ import { VisitorDisplayPage } from './pages/VisitorDisplayPage';
 import { LabelPrintPage } from './pages/LabelPrintPage';
 import { DeliverySettingsPage } from './pages/DeliverySettingsPage';
 import { DeliveryOrdersPage } from './pages/DeliveryOrdersPage';
+import { DeliveryPreparationsPage } from './pages/DeliveryPreparationsPage';
 import { DeliverySettlementsPage } from './pages/DeliverySettlementsPage';
 import { DeliveryMyOrdersPage } from './pages/DeliveryMyOrdersPage';
 import { DeliveryReportsPage } from './pages/DeliveryReportsPage';
@@ -403,6 +404,7 @@ export default function App() {
     'settings',
     'delivery_settings',
     'delivery_orders',
+    'delivery_preparations',
     'delivery_settlements',
     'delivery_my_orders',
     'delivery_reports'
@@ -3133,6 +3135,16 @@ export default function App() {
             ) : (
               <div className="p-8 text-center text-rose-600 bg-rose-50 rounded-2xl border border-rose-200 font-bold">
                 غير مصرح لك بعرض طلبات التوصيل
+              </div>
+            )
+          )}
+
+          {currentPage === 'delivery_preparations' && isPageAllowedByFeatureModes('delivery_preparations', currentTab, featureFlags) && (
+            (user.role === 'designer' || Boolean(user.isOwner) || hasPermission(user, 'delivery.view') || hasPermission(user, 'delivery.manage')) ? (
+              <DeliveryPreparationsPage user={user} onDataChanged={loadData} />
+            ) : (
+              <div className="p-8 text-center text-rose-600 bg-rose-50 rounded-2xl border border-rose-200 font-bold">
+                غير مصرح لك بعرض أوامر التجهيز
               </div>
             )
           )}

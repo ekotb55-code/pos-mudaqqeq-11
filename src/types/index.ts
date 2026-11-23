@@ -1258,6 +1258,7 @@ export type PageType =
   | 'label_print'
   | 'delivery_settings'
   | 'delivery_orders'
+  | 'delivery_preparations'
   | 'delivery_settlements'
   | 'delivery_my_orders'
   | 'delivery_reports';

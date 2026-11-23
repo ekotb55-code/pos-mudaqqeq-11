@@ -1972,6 +1972,12 @@ export const PosInvoicePanel: React.FC<PosInvoicePanelProps> = ({
               className="pt-3 border-t border-slate-200 space-y-3 text-xs"
               data-testid="pos-delivery-section"
             >
+              <div
+                data-testid="pos-delivery-prep-note"
+                className="border-r-4 border-amber-600 pr-2 py-1 text-[11px] font-bold text-amber-800 leading-relaxed"
+              >
+                الحفظ هنا بيعمل «أمر تجهيز» مش فاتورة. الفاتورة وخصم المخزون وتسجيل الفلوس بيحصلوا عند الشحن من صفحة «أوامر التجهيز».
+              </div>
               {/* طريقة التحصيل بالتوصيل */}
               <div className="space-y-1">
                 <label className="text-[11px] font-bold text-slate-800 block">
@@ -2508,7 +2514,7 @@ export const PosInvoicePanel: React.FC<PosInvoicePanelProps> = ({
             className="min-h-[52px] h-[52px] px-2.5 rounded-xl bg-[#4CAF7A] hover:bg-[#439e6b] disabled:opacity-40 disabled:cursor-not-allowed text-white font-extrabold text-sm sm:text-[15px] flex items-center justify-center gap-1.5 shadow-sm transition active:scale-98 cursor-pointer"
           >
             <Printer className="w-4 h-4 shrink-0" />
-            <span>{isSubmitting ? 'جاري الحفظ...' : 'حفظ وطباعة'}</span>
+            <span>{isSubmitting ? 'جاري الحفظ...' : isDeliveryOrderActive ? 'أمر تجهيز وطباعة البون' : 'حفظ وطباعة'}</span>
             <ShortcutBadge actionId="pos.save_and_print" />
           </button>
 
@@ -2520,7 +2526,7 @@ export const PosInvoicePanel: React.FC<PosInvoicePanelProps> = ({
             className="min-h-[52px] h-[52px] px-2.5 rounded-xl bg-[#1678C2] hover:bg-[#1366a6] disabled:opacity-40 disabled:cursor-not-allowed text-white font-extrabold text-sm sm:text-[15px] flex items-center justify-center gap-1.5 shadow-sm transition active:scale-98 cursor-pointer"
           >
             <Check className="w-4 h-4 shrink-0" />
-            <span>{isSubmitting ? 'جاري الحفظ...' : 'حفظ فقط'}</span>
+            <span>{isSubmitting ? 'جاري الحفظ...' : isDeliveryOrderActive ? 'أمر تجهيز فقط' : 'حفظ فقط'}</span>
             <ShortcutBadge actionId="pos.save_only" />
           </button>
 

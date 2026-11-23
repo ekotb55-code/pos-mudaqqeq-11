@@ -161,6 +161,7 @@ const OFFLINE_DISABLED_PAGES = new Set<PageType>([
   'warehouse_dispatch_orders',
   'delivery_settings',
   'delivery_orders',
+  'delivery_preparations',
   'delivery_settlements',
   'delivery_my_orders',
   'delivery_reports'

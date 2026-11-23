@@ -239,6 +239,7 @@ export const NAV_GROUPS: NavGroup[] = [
       Boolean(user?.isOwner) ||
       hasPermission(user, 'delivery.driver') ||
       hasPermission(user, 'delivery.view') ||
+      hasPermission(user, 'delivery.manage') ||
       hasPermission(user, 'delivery.settle') ||
       hasPermission(user, 'delivery.reports') ||
       hasPermission(user, 'delivery.settings'),
@@ -266,6 +267,19 @@ export const NAV_GROUPS: NavGroup[] = [
           user?.role === 'designer' ||
           Boolean(user?.isOwner) ||
           hasPermission(user, 'delivery.view')
+      },
+      {
+        id: 'delivery-preparations',
+        page: 'delivery_preparations',
+        path: '/delivery/preparations',
+        labelAr: 'أوامر التجهيز',
+        labelEn: 'Delivery Preparation Orders',
+        icon: ClipboardList,
+        permission: (user) =>
+          user?.role === 'designer' ||
+          Boolean(user?.isOwner) ||
+          hasPermission(user, 'delivery.view') ||
+          hasPermission(user, 'delivery.manage')
       },
       {
         id: 'delivery-settlements',
@@ -1206,6 +1220,7 @@ export const SALES_ONLY_ALLOWED_PAGES = new Set<PageType>([
   'credit_collection',
   'settings',
   'delivery_orders',
+  'delivery_preparations',
   'delivery_my_orders',
   'sync',
   'visitor'
@@ -1444,6 +1459,7 @@ export function normalizeNavigationTarget(
         'customers',
         'credit_collection',
         'delivery_orders',
+        'delivery_preparations',
         'delivery_my_orders',
         'sync',
         'settings',
@@ -1464,6 +1480,7 @@ export function normalizeNavigationTarget(
         'returns',
         'credit_collection',
         'delivery_orders',
+        'delivery_preparations',
         'delivery_settlements',
         'delivery_my_orders',
         'delivery_reports',

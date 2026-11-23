@@ -69,6 +69,8 @@ import {
 } from 'lucide-react';
 import { UserAccount, PageType } from '../types';
 import { hasPermission } from '../utils/permissions';
+import { printDeliveryPrepSlip } from '../utils/printDeliveryPrepSlip';
+import { buildPrepSlipData, prepErrorText } from '../utils/deliveryPrep';
 import {
   readUiPrefs,
   writeUiPrefs,
@@ -3399,6 +3401,111 @@ export const POSPage: React.FC<POSPageProps> = ({
           return;
         }
       }
+    }
+
+    // أمر تجهيز التوصيل: مع تفعيل «توصيل» الحفظ بيعمل أمر تجهيز مش فاتورة.
+    // الفاتورة وخصم المخزون وتسجيل الفلوس بيحصلوا عند الشحن من صفحة «أوامر التجهيز».
+    if (activeDeliveryOrder) {
+      if (!selectedCustomerId) {
+        setCustomerFieldError(true);
+        setErrorMsg('اختر العميل أولًا لعمل أمر تجهيز التوصيل');
+        return;
+      }
+      // السيرفر بيسجل أمر التجهيز بسعر الصنف المسجل، فالسعر المعدّل في السلة ما يتنقلش من غير ما المستخدم يعرف
+      const editedPriceLine = cart.find(
+        c => Math.abs((Number(c.baseUnitPrice) || 0) - (Number(c.item.salePrice) || 0)) > 0.005
+      );
+      if (editedPriceLine) {
+        setPriceViolatingItemIds(new Set([editedPriceLine.item.id]));
+        setErrorMsg(
+          `أمر التجهيز بيتسجل بسعر الصنف المسجل. رجّع سعر «${editedPriceLine.item.name}» لسعره الأصلي أو عدّل سعر الصنف نفسه`
+        );
+        return;
+      }
+
+      isSubmittingRef.current = true;
+      setIsSubmitting(true);
+      setErrorMsg(null);
+      setIsUnknownResultError(false);
+      try {
+        const prepRes = await api.createDeliveryPreparationOrder({
+          idempotencyKey: idempotencyKeyRef.current,
+          customerId: selectedCustomerId,
+          paymentMode: deliveryPaymentMode,
+          address: deliveryAddress.trim(),
+          ...(deliveryPhone.trim() ? { phone: deliveryPhone.trim() } : {}),
+          ...(deliveryConfig?.settings.zonePricing && selectedDeliveryZone
+            ? { zoneId: selectedDeliveryZone.id }
+            : {}),
+          ...(canEditDeliveryFee && deliveryFeeManual ? { fee: effectiveDeliveryOrderFee } : {}),
+          ...(deliveryAssigneeType && deliveryAssigneeId
+            ? {
+                assigneeType: deliveryAssigneeType,
+                assigneeId: deliveryAssigneeId,
+                ...(deliveryAssigneeType === 'courier' && deliveryTrackingNumber.trim()
+                  ? { trackingNumber: deliveryTrackingNumber.trim() }
+                  : {})
+              }
+            : {}),
+          ...(notes.trim() ? { notes: notes.trim() } : {}),
+          lines: cart.map(c => ({ itemId: c.item.id, quantity: c.quantity }))
+        });
+        const prepOrder = prepRes.order;
+        const prepSlipSettings = deliveryConfig?.settings?.prepSlip;
+
+        try {
+          getCartJournal().cartSaved();
+        } catch {
+          // تجاهل أي خطأ في السجل حتى لا يتعطل الحفظ
+        }
+        clearPosDraft(draftStorageKey);
+        idempotencyKeyRef.current = generateIdempotencyKey();
+
+        setCart([]);
+        setDeliveryFee(0);
+        setNotes('');
+        resetDeliveryOrderState();
+        setIsManualCashOverride(false);
+        setPaidAmountInput('0.00');
+        setPaymentType('نقدي');
+        setCreditPartyType('customer');
+        setSelectedCustomerId(resolveDefaultCustomerId(salesRules, customers));
+        setCustomerFieldError(false);
+        setPriceViolatingItemIds(new Set());
+        setActiveMobileTab('invoice');
+        mobileTabScrollRef.current.invoice = 0;
+
+        if (addedItemToastTimerRef.current) {
+          clearTimeout(addedItemToastTimerRef.current);
+        }
+        setAddedItemToast(`تم حفظ أمر التجهيز ${prepOrder.number}`);
+        addedItemToastTimerRef.current = setTimeout(() => {
+          setAddedItemToast(null);
+        }, 4000);
+
+        // بون التجهيز: يتطبع مع «حفظ وطباعة» بس، ولو مفعّل من إعدادات التوصيل
+        if (printMode !== 'no_print' && prepSlipSettings?.enabled) {
+          void printDeliveryPrepSlip(buildPrepSlipData(prepOrder), {
+            settings: prepSlipSettings,
+            paperSize: invoicePrintSettings?.paperSize,
+            printableWidthMm: invoicePrintSettings?.printableWidthMm
+          }).catch(() => {
+            setErrorMsg(`اتحفظ أمر التجهيز ${prepOrder.number} لكن تعذرت طباعة البون. اطبعه من صفحة «أوامر التجهيز»`);
+          });
+        }
+
+        setTimeout(() => {
+          const barcodeInput = document.getElementById('pos-barcode-input');
+          barcodeInput?.focus();
+        }, 100);
+      } catch (err: any) {
+        setErrorMsg(prepErrorText(err, 'تعذر حفظ أمر تجهيز التوصيل، يرجى مراجعة الاتصال والمحاولة مرة أخرى'));
+        setIsUnknownResultError(err?.code === 'UNKNOWN_RESULT');
+      } finally {
+        isSubmittingRef.current = false;
+        setIsSubmitting(false);
+      }
+      return;
     }
 
     const resolvedDirectOrFallbackPaymentType: 'نقدي' | 'آجل' | 'جزئي' = activeCodDelivery
