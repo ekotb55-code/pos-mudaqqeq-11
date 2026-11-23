@@ -3415,7 +3415,7 @@ export async function createServerApp(options?: { attachVite?: boolean; persiste
   // جلب سجلات تعديل الفاتورة
   app.get('/api/invoices/:id/logs', requirePermission('invoices.view') as any, async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const logs = await getInvoiceEditLogs(req.params.id);
+      const logs = await getInvoiceEditLogs(req.params.id, req.userSession);
       const staleMeta = getStaleMeta(logs);
       res.json({
         success: true,

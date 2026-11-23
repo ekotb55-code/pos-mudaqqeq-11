@@ -24,7 +24,8 @@ import {
   findInvoiceByIdempotencyKey,
   findInvoiceByNumber,
   linkInvoiceToPreparation,
-  recordAuditLog
+  recordAuditLog,
+  redactInvoiceForViewer
 } from './sheetsService.ts';
 import { DIRECT_SALE_PLATFORM_NAME } from './salesRules.ts';
 import type { Invoice } from '../src/types/index.ts';
@@ -478,7 +479,7 @@ export async function dispatchPreparationOrder(
 
       return {
         order: prep,
-        invoice: existingInvoice,
+        invoice: redactInvoiceForViewer(existingInvoice, session),
         deliveryOrder: existingDeliveryOrder,
         duplicate: true
       };
@@ -698,7 +699,7 @@ export async function dispatchPreparationOrder(
 
     return {
       order: updatedPrep,
-      invoice: linkedInvoice,
+      invoice: redactInvoiceForViewer(linkedInvoice, session),
       deliveryOrder,
       ...(wasRecovered ? { duplicate: true, recovered: true } : {})
     };

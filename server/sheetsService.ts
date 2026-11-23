@@ -11974,7 +11974,7 @@ export async function createInvoice(
     return {
       success: true,
       duplicate: true,
-      invoice: cached,
+      invoice: redactInvoiceForViewer(cached, session),
       finalInvoiceNumber: cached.invoiceNumber,
       provisionalInvoiceNumber: cached.offlineProvisionalNo || rawProvNo || undefined,
       needsReview: Boolean(cached.needsReview),
@@ -12018,7 +12018,7 @@ export async function createInvoice(
     return {
       success: true,
       duplicate: true,
-      invoice: existingInv,
+      invoice: redactInvoiceForViewer(existingInv, session),
       finalInvoiceNumber: existingInv.invoiceNumber,
       provisionalInvoiceNumber: existingInv.offlineProvisionalNo || rawProvNo || undefined,
       needsReview: Boolean(existingInv.needsReview),
@@ -12862,9 +12862,6 @@ export async function createInvoice(
     }
   }
 
-  const canViewProfit = isDesigner || session?.permissions?.includes('reports.view_profit');
-  const canViewPurchase = isDesigner || session?.permissions?.includes('prices.view_purchase');
-
   const invoiceStatus = paymentType === 'آجل' ? 'معلّقة' : 'تم البيع';
   const creditStatus = paymentType === 'آجل' ? 'معلّقة' : undefined;
   const needsReviewFlag = isOfflineMode ? reviewReasonsList.length > 0 : Boolean(invoicePayload.needsReview);
@@ -12905,7 +12902,8 @@ export async function createInvoice(
     deliveryFee,
     taxAmount: totalTax,
     netAmount,
-    profit: canViewProfit ? totalProfit : undefined,
+    // الربح والتكلفة بيتحفظوا دايمًا، والإخفاء حسب الصلاحية في الرد بس (redactInvoiceForViewer)
+    profit: totalProfit,
     status: invoiceStatus,
     notes: invoicePayload.notes || '',
     ...(platformOrderId ? { platformOrderId } : {}),
@@ -12925,12 +12923,7 @@ export async function createInvoice(
           reviewReasons: reviewReasonsList
         }
       : {}),
-    lines: calculatedLines.map(cl => ({
-      ...cl,
-      purchasePriceAtSale: canViewPurchase ? cl.purchasePriceAtSale : undefined,
-      packagingCostAtSale: canViewPurchase ? cl.packagingCostAtSale : undefined,
-      unitProfit: canViewProfit ? cl.unitProfit : undefined
-    }))
+    lines: calculatedLines.map(cl => ({ ...cl }))
   };
 
   // طلب التوصيل بيتسجل مع الفاتورة
@@ -12979,7 +12972,7 @@ export async function createInvoice(
 
   return {
     success: true,
-    invoice: newInvoice,
+    invoice: redactInvoiceForViewer(newInvoice, session),
     finalInvoiceNumber: invoiceNumber,
     provisionalInvoiceNumber: offlineProvisionalNo || undefined,
     needsReview: needsReviewFlag,
@@ -13374,7 +13367,7 @@ export async function markOfflineInvoiceReviewed(
   return {
     success: true,
     statusCode: 200,
-    invoice: { ...foundInv },
+    invoice: redactInvoiceForViewer({ ...foundInv }, session),
     message: 'تم اعتماد مراجعة الفاتورة بنجاح'
   };
 }
@@ -13745,9 +13738,6 @@ export async function updateInvoice(
   };
   memoryInvoiceEditLogs.unshift(editLogEntry);
 
-  const canViewProfit = isDesigner || perms.includes('reports.view_profit');
-  const canViewPurchase = isDesigner || perms.includes('prices.view_purchase');
-
   const updatedInvoice: Invoice = {
     ...oldInvoice,
     platform: platform.name,
@@ -13763,21 +13753,17 @@ export async function updateInvoice(
     deliveryFee,
     taxAmount: totalTax,
     netAmount,
-    profit: canViewProfit ? totalProfit : undefined,
+    // الربح والتكلفة بيتحفظوا دايمًا، والإخفاء حسب الصلاحية في الرد بس (redactInvoiceForViewer)
+    profit: totalProfit,
     notes: payload.notes !== undefined ? payload.notes : oldInvoice.notes,
     status: oldInvoice.status || 'تم البيع',
-    lines: calculatedLines.map(cl => ({
-      ...cl,
-      purchasePriceAtSale: canViewPurchase ? cl.purchasePriceAtSale : undefined,
-      packagingCostAtSale: canViewPurchase ? cl.packagingCostAtSale : undefined,
-      unitProfit: canViewProfit ? cl.unitProfit : undefined
-    }))
+    lines: calculatedLines.map(cl => ({ ...cl }))
   };
 
   memoryInvoices[existingIdx] = updatedInvoice;
   recordAuditLog(session || {}, 'INVOICE_EDIT', 'Invoice', invoiceNumber, `تعديل فاتورة ${invoiceNumber}. السبب: ${editReason}`);
 
-  return { success: true, invoice: updatedInvoice };
+  return { success: true, invoice: redactInvoiceForViewer(updatedInvoice, session) };
 }
 
 // ===================== صور الأصناف بالجملة (استيراد الأصناف بالصور / تعديل الصور بالإكسيل) =====================
@@ -13922,20 +13908,26 @@ export function setInvoicePlatformOrderId(
   else delete (updated as any).platformOrderId;
   memoryInvoices[idx] = updated;
   recordAuditLog(session || {}, 'INVOICE_PLATFORM_ORDER_EDIT', 'Invoice', invoiceNumber, `رقم طلب المنصة للفاتورة ${invoiceNumber}: «${before || 'فاضي'}» ← «${orderId || 'فاضي'}». السبب: ${reason}`);
-  return { success: true, invoice: updated };
+  return { success: true, invoice: redactInvoiceForViewer(updated, session) };
 }
 
 /**
  * جلب سجلات تعديل الفواتير
  */
-export async function getInvoiceEditLogs(invoiceNumber?: string): Promise<InvoiceEditLogEntry[]> {
+export async function getInvoiceEditLogs(
+  invoiceNumber?: string,
+  viewer?: { role?: UserRole; isOwner?: boolean; permissions?: PermissionKey[] }
+): Promise<InvoiceEditLogEntry[]> {
   if (isSheetsDataMode()) {
     return [];
   }
-  if (invoiceNumber) {
-    return memoryInvoiceEditLogs.filter(l => l.invoiceNumber === invoiceNumber);
-  }
-  return memoryInvoiceEditLogs;
+  const logs = invoiceNumber ? memoryInvoiceEditLogs.filter(l => l.invoiceNumber === invoiceNumber) : memoryInvoiceEditLogs;
+  // نسختين «قبل» و«بعد» فيهم الفاتورة كاملة: يتخفى منهم الربح والتكلفة حسب صلاحية اللي بيقرا
+  return logs.map(l => ({
+    ...l,
+    beforeSnapshot: redactInvoiceForViewer(l.beforeSnapshot, viewer),
+    afterSnapshot: redactInvoiceForViewer(l.afterSnapshot, viewer)
+  }));
 }
 
 /**
@@ -13968,6 +13960,35 @@ export async function saveTaxSettings(
   const updated = setTaxSettings(candidate);
   recordAuditLog(session || {}, 'SETTINGS_TAX_UPDATE', 'Settings', 'taxSettings', `تحديث إعدادات الضريبة: شاملة=${updated.taxInclusive}, احتساب العمولة=${updated.platformCommissionOn}`);
   return { success: true, taxSettings: updated };
+}
+
+/**
+ * نسخة للعرض من الفاتورة: تخفي الربح والتكلفة عن اللي معندوش الصلاحية.
+ * الفاتورة المحفوظة نفسها تفضل كاملة دايمًا، لأن التقارير محتاجة تكلفة وقت البيع.
+ */
+export function redactInvoiceForViewer<T extends Partial<Invoice> | null | undefined>(
+  invoice: T,
+  viewer?: { role?: UserRole; isOwner?: boolean; permissions?: PermissionKey[] }
+): T {
+  if (!invoice || typeof invoice !== 'object') return invoice;
+  const isDesigner = viewer?.role === 'designer' || Boolean(viewer?.isOwner);
+  const perms = viewer?.permissions || [];
+  const canViewProfit = isDesigner || perms.includes('reports.view_profit');
+  const canViewPurchase = isDesigner || perms.includes('prices.view_purchase');
+  // اللي يشوف كل حاجة بياخد الفاتورة زي ما كانت بترجع قبل كده بالظبط (من غير نسخة)
+  if (canViewProfit && canViewPurchase) return invoice;
+  return {
+    ...invoice,
+    profit: canViewProfit ? invoice.profit : undefined,
+    lines: Array.isArray(invoice.lines)
+      ? invoice.lines.map(l => ({
+          ...l,
+          purchasePriceAtSale: canViewPurchase ? l.purchasePriceAtSale : undefined,
+          packagingCostAtSale: canViewPurchase ? l.packagingCostAtSale : undefined,
+          unitProfit: canViewProfit ? l.unitProfit : undefined
+        }))
+      : invoice.lines
+  } as T;
 }
 
 /**
@@ -17427,7 +17448,7 @@ export async function cancelInvoice(
   invoice.status = 'ملغاة';
   recordAuditLog(session || {}, 'CANCEL_INVOICE', 'Invoice', invoice.invoiceNumber, `إلغاء فاتورة بيع بقيمة ${invoice.netAmount} ج.م. السبب: ${reason || 'غير محدد'}`);
 
-  return { success: true, invoice };
+  return { success: true, invoice: redactInvoiceForViewer(invoice, session) };
 }
 
 /**
@@ -19712,7 +19733,7 @@ export async function getPartyLedger(
     .map(inv => {
       const due = calculateInvoiceCreditDueAmount(inv, partyType);
       return {
-        ...inv,
+        ...redactInvoiceForViewer(inv, session),
         creditPartyType: partyType,
         creditPartyId: partyId,
         creditPartyName: partyName,
