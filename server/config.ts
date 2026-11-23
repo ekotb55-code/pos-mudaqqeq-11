@@ -74,10 +74,24 @@ const defaultTaxSettings: TaxSettings = {
   platformCommissionOn: 'before_tax' // احتساب العمولة قبل الضريبة افتراضياً
 };
 
-// حالة النظام الحالية - منفذ 3000 الإلزامي للعمل داخل AI Studio
+/**
+ * تحليل والتحقق من منفذ تشغيل الخادم من متغير البيئة PORT (عدد صحيح بين 1 و 65535، والافتراضي 3000)
+ */
+export function resolveServerPort(rawPort: unknown = process.env.PORT, fallback = 3000): number {
+  const raw = typeof rawPort === 'number' ? String(rawPort) : typeof rawPort === 'string' ? rawPort.trim() : '';
+  if (!raw) return fallback;
+  if (!/^\d+$/.test(raw)) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    return fallback;
+  }
+  return parsed;
+}
+
+// حالة النظام الحالية - قراءة المنفذ من متغير البيئة PORT مع إبقاء 3000 قيمة افتراضية
 const systemConfig: SystemConfig = {
   appsScriptUrl: currentAppsScriptUrl,
-  port: 3000,
+  port: resolveServerPort(),
   dataMode: initialDataMode,
   connectionHealth: {
     healthy: initialDataMode === 'sheets',
@@ -100,6 +114,7 @@ const systemConfig: SystemConfig = {
  * الحصول على الإعدادات الحالية
  */
 export function getSystemConfig(): SystemConfig {
+  systemConfig.port = resolveServerPort();
   if (isDatabasePersistenceConfigured() && systemConfig.appsScriptUrl) {
     // عند تفعيل قاعدة البيانات لا يُستخدم Google Sheets إطلاقًا
     currentAppsScriptUrl = '';

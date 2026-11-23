@@ -603,6 +603,8 @@ export interface Invoice {
   pickupFeeAmount?: number; // إجمالي رسوم الالتقاط للفاتورة
   deliveryFee?: number; // رسوم التوصيل
   deliveryOrderId?: string; // طلب التوصيل (لو الفاتورة توصيل)
+  preparationId?: string; // معرّف طلب تحضير التوصيل المرتبط (إن وجد)
+  preparationNumber?: string; // رقم طلب تحضير التوصيل المرتبط (PRP-...)
   bnplTotalAmount?: number; // إجمالي خصم / زيادة تقسيط المنصة BNPL
   bnplEnabled?: boolean; // حالة تفعيل BNPL على الفاتورة
   bnplPercentApplied?: number; // نسبة BNPL المطبقة على الفاتورة %
@@ -2066,6 +2068,8 @@ export interface DeliveryOrder {
   settlementId: string;
   payoutId: string;
   returnNumber: string;
+  preparationId?: string;
+  preparationNumber?: string;
 }
 
 export interface DeliveryConfigZoneOption {
@@ -2158,6 +2162,150 @@ export interface DeliveryChangeOrderStatusResponse {
   returnNumber: string;
   error?: string;
 }
+
+export type DeliveryPreparationStatus = 'قيد التحضير' | 'جاري الشحن' | 'خرج للتوصيل' | 'اتلغى';
+
+export interface DeliveryPreparationLine {
+  itemId: string;
+  itemName: string;
+  unit: string;
+  quantity: number;
+  unitPrice: number;
+  lineTotal: number;
+}
+
+export interface DeliveryPreparationOrder {
+  id: string;
+  number: string;
+  status: DeliveryPreparationStatus;
+  revision: number;
+  idempotencyKey: string;
+  createdAt: string;
+  createdBy: string;
+  createdById: string;
+  updatedAt: string;
+  updatedBy: string;
+  updatedById: string;
+  cancelledAt: string;
+  cancelledBy: string;
+  cancelledById: string;
+  cancelReason: string;
+  customerId: string;
+  customerName: string;
+  phone: string;
+  address: string;
+  zoneId: string;
+  zoneName: string;
+  zoneCommission: number;
+  fee: number;
+  feeManual: boolean;
+  paymentMode: DeliveryPaymentMode;
+  assigneeType: DeliveryAssigneeType | '';
+  assigneeId: string;
+  assigneeName: string;
+  trackingNumber: string;
+  notes: string;
+  lines: DeliveryPreparationLine[];
+  itemsSubtotal: number;
+  estimatedTotal: number;
+  invoiceNumber?: string;
+  deliveryOrderId?: string;
+  deliveryOrderNumber?: string;
+  dispatchedAt?: string;
+  dispatchedBy?: string;
+  dispatchedById?: string;
+  dispatchIdempotencyKey?: string;
+}
+
+export interface DeliveryPreparationLineInput {
+  itemId: string;
+  quantity: number;
+}
+
+export interface CreateDeliveryPreparationPayload {
+  idempotencyKey: string;
+  customerId?: string;
+  customerName?: string;
+  phone?: string;
+  address: string;
+  zoneId?: string;
+  fee?: number;
+  paymentMode: DeliveryPaymentMode;
+  assigneeType?: DeliveryAssigneeType | '';
+  assigneeId?: string;
+  trackingNumber?: string;
+  notes?: string;
+  lines: DeliveryPreparationLineInput[];
+}
+
+export interface UpdateDeliveryPreparationPayload {
+  revision: number;
+  customerId?: string;
+  customerName?: string;
+  phone?: string;
+  address?: string;
+  zoneId?: string;
+  fee?: number;
+  paymentMode?: DeliveryPaymentMode;
+  assigneeType?: DeliveryAssigneeType | '';
+  assigneeId?: string;
+  trackingNumber?: string;
+  notes?: string;
+  lines?: DeliveryPreparationLineInput[];
+}
+
+export interface CancelDeliveryPreparationPayload {
+  reason?: string;
+  revision?: number;
+}
+
+export interface DispatchDeliveryPreparationPayload {
+  revision?: number;
+  assigneeType?: DeliveryAssigneeType;
+  assigneeId?: string;
+  trackingNumber?: string;
+  warehouseId?: string;
+  cashboxId?: string;
+  paymentMethod?: string;
+  paidAmount?: number;
+  referenceNumber?: string;
+  notes?: string;
+}
+
+export interface DispatchDeliveryPreparationResponse {
+  success: boolean;
+  duplicate?: boolean;
+  recovered?: boolean;
+  order: DeliveryPreparationOrder;
+  invoice: Invoice;
+  deliveryOrder: DeliveryOrder;
+  error?: string;
+  code?: string;
+}
+
+export interface DeliveryPreparationOrdersListParams {
+  status?: DeliveryPreparationStatus;
+  customerId?: string;
+  zoneId?: string;
+  from?: string;
+  to?: string;
+  open?: boolean;
+}
+
+export interface DeliveryPreparationOrderResponse {
+  success: boolean;
+  duplicate?: boolean;
+  order: DeliveryPreparationOrder;
+  error?: string;
+  code?: string;
+}
+
+export interface DeliveryPreparationOrdersListResponse {
+  success: boolean;
+  orders: DeliveryPreparationOrder[];
+  error?: string;
+}
+
 
 export interface DeliverySettlement {
   id: string;

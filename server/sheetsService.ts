@@ -2045,50 +2045,7 @@ export async function setupSheets(sessionToken?: string, customUrl?: string) {
 /**
  * إنشاء أول مالك ومصمم للنظام في وضع الذاكرة المحلية (إذا لم يكن هناك أي مالك سابق)
  */
-// إدارة محاولات الدخول الفاشلة والحماية من التخمين Brute-force protection
-// بعد 5 محاولات فاشلة يتم قفل الحساب لمدة 15 دقيقة
-interface FailedAttemptRecord {
-  count: number;
-  lockedUntil?: number;
-}
-const failedAttemptsMap = new Map<string, FailedAttemptRecord>();
-const MAX_FAILED_ATTEMPTS = 5;
-const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 دقيقة
-
-function checkRateLimit(normUser: string): { locked: boolean; remainingMinutes?: number } {
-  const record = failedAttemptsMap.get(normUser);
-  if (!record) return { locked: false };
-
-  if (record.lockedUntil) {
-    if (Date.now() < record.lockedUntil) {
-      const remainingMinutes = Math.ceil((record.lockedUntil - Date.now()) / (60 * 1000));
-      return { locked: true, remainingMinutes };
-    }
-    // انتهاء فترة القفل
-    failedAttemptsMap.delete(normUser);
-    return { locked: false };
-  }
-
-  return { locked: false };
-}
-
-function recordFailedAttempt(normUser: string): { lockedNow: boolean; remainingMinutes?: number } {
-  const record = failedAttemptsMap.get(normUser) || { count: 0 };
-  record.count += 1;
-
-  if (record.count >= MAX_FAILED_ATTEMPTS) {
-    record.lockedUntil = Date.now() + LOCKOUT_DURATION_MS;
-    failedAttemptsMap.set(normUser, record);
-    return { lockedNow: true, remainingMinutes: 15 };
-  }
-
-  failedAttemptsMap.set(normUser, record);
-  return { lockedNow: false };
-}
-
-function clearFailedAttempts(normUser: string) {
-  failedAttemptsMap.delete(normUser);
-}
+export const INVALID_CREDENTIALS_ERROR = 'اسم المستخدم أو كلمة المرور غير صحيحة';
 
 /**
  * إنشاء أول مالك ومصمم للنظام في وضع الذاكرة المحلية (إذا لم يكن هناك أي مالك سابق)
@@ -2180,15 +2137,6 @@ export async function loginUser(
     return { success: false, error: 'يرجى إدخال اسم المستخدم وكلمة المرور' };
   }
 
-  // فحص الحماية من التخمين
-  const rateLimit = checkRateLimit(normUser);
-  if (rateLimit.locked) {
-    return {
-      success: false,
-      error: `تم قفل الحساب مؤقتًا لتكرار المحاولات الخاطئة (5 محاولات). يرجى المحاولة بعد ${rateLimit.remainingMinutes} دقيقة.`
-    };
-  }
-
   const config = getSystemConfig();
 
   if (isSheetsDataMode(config)) {
@@ -2201,7 +2149,6 @@ export async function loginUser(
       offlineIterations: offlineVer.offlineIterations
     });
     if (res.success && res.user) {
-      clearFailedAttempts(normUser);
       return {
         success: true,
         user: {
@@ -2228,8 +2175,16 @@ export async function loginUser(
         error: res.error || 'تعذر الاتصال بقاعدة البيانات للتحقق من بيانات الدخول'
       };
     }
-    recordFailedAttempt(normUser);
-    return { success: false, error: res.error };
+    const rawSheetsErr = String(res.error || '').trim();
+    const isCredentialOrOldLockError =
+      rawSheetsErr.includes('اسم المستخدم') ||
+      rawSheetsErr.includes('كلمة المرور') ||
+      rawSheetsErr.includes('محاولات') ||
+      rawSheetsErr.includes('قفل الحساب مؤقت');
+    return {
+      success: false,
+      error: isCredentialOrOldLockError ? INVALID_CREDENTIALS_ERROR : rawSheetsErr
+    };
   }
 
   // ضمان وجود الحسابات الثلاثة الافتراضية إذا كان النظام فارغاً تماماً
@@ -2243,33 +2198,22 @@ export async function loginUser(
   );
 
   if (!user) {
-    recordFailedAttempt(normUser);
-    return { success: false, error: 'اسم المستخدم غير مسجل في النظام' };
+    return { success: false, error: INVALID_CREDENTIALS_ERROR };
+  }
+
+  const computedHash = hashPassword(password, user.salt);
+  if (computedHash !== user.passwordHash) {
+    return {
+      success: false,
+      error: INVALID_CREDENTIALS_ERROR
+    };
   }
 
   if (user.status !== 'active' && (user.status as any) !== 'نشط') {
     return { success: false, error: 'هذا الحساب موقوف، راجع مالك النظام' };
   }
 
-  const computedHash = hashPassword(password, user.salt);
-  if (computedHash !== user.passwordHash) {
-    const failRes = recordFailedAttempt(normUser);
-    if (failRes.lockedNow) {
-      return {
-        success: false,
-        error: 'تم تجاوز الحد الأقصى للمحاولات الخاطئة (5 محاولات). تم إيقاف الحساب مؤقتًا لمدة 15 دقيقة.'
-      };
-    }
-    const currentRecord = failedAttemptsMap.get(normUser);
-    const triesLeft = MAX_FAILED_ATTEMPTS - (currentRecord?.count || 1);
-    return {
-      success: false,
-      error: `كلمة المرور غير صحيحة. متبقي ${triesLeft} محاولة قبل قفل الحساب مؤقتًا.`
-    };
-  }
-
-  // تسجيل دخول ناجح - تصفير عداد المحاولات الفاشلة وحساب بصمة التحقق بدون إنترنت PBKDF2-SHA256 (200,000 دورة)
-  clearFailedAttempts(normUser);
+  // تسجيل دخول ناجح - حساب بصمة التحقق بدون إنترنت PBKDF2-SHA256 (200,000 دورة)
 
   const offlineVer = computeOfflinePasswordVerifier(password);
   user.offlineVerifier = offlineVer.offlineVerifier;
@@ -12364,6 +12308,14 @@ export async function createInvoice(
         addReviewReason('رصيد سالب');
       }
     } else {
+      if (item.status === 'inactive' || item.status === 'موقوف' || item.status === 'مؤرشف') {
+        return {
+          success: false,
+          statusCode: 400,
+          code: 'ITEM_INACTIVE',
+          error: `الصنف "${item.name}" موقوف أو مؤرشف وغير متاح للبيع`
+        };
+      }
       // فحص إتاحة الصنف على المنصة المحددة
       if (item.platformIds && item.platformIds.length > 0 && !item.platformIds.includes(platform.id)) {
         return {
@@ -12373,10 +12325,12 @@ export async function createInvoice(
         };
       }
       if (!memoryStockSettings.allowNegativeStockSale && availableInWarehouse < totalRequested) {
+        const missingQty = Math.round((totalRequested - availableInWarehouse) * 1000) / 1000;
         return {
           success: false,
           statusCode: 400,
-          error: `الكمية غير متوفرة للصنف "${item.name}" في مخزن "${resolvedWarehouse.name}". المتاح: ${availableInWarehouse}`
+          code: 'INSUFFICIENT_STOCK',
+          error: `الكمية غير متوفرة للصنف "${item.name}" في مخزن "${resolvedWarehouse.name}". المطلوب: ${totalRequested}، المتاح: ${availableInWarehouse}، الكمية الناقصة: ${missingQty}`
         };
       }
     }
@@ -12955,6 +12909,8 @@ export async function createInvoice(
     status: invoiceStatus,
     notes: invoicePayload.notes || '',
     ...(platformOrderId ? { platformOrderId } : {}),
+    ...(invoicePayload.preparationId ? { preparationId: String(invoicePayload.preparationId).trim().slice(0, 100) } : {}),
+    ...(invoicePayload.preparationNumber ? { preparationNumber: String(invoicePayload.preparationNumber).trim().slice(0, 60) } : {}),
     createdBy: session?.name || session?.phone || invoicePayload.createdBy || 'كاشير',
     ...(isOfflineMode
       ? {
@@ -12979,7 +12935,17 @@ export async function createInvoice(
 
   // طلب التوصيل بيتسجل مع الفاتورة
   if (deliveryPlan) {
-    const deliveryOrder = createOrderForInvoice(deliveryPlan, { invoiceNumber, total: netAmount }, session as any, now);
+    const deliveryOrder = createOrderForInvoice(
+      deliveryPlan,
+      {
+        invoiceNumber,
+        total: netAmount,
+        preparationId: newInvoice.preparationId,
+        preparationNumber: newInvoice.preparationNumber
+      },
+      session as any,
+      now
+    );
     newInvoice.deliveryOrderId = deliveryOrder.id;
   }
 
@@ -20496,4 +20462,126 @@ export function closeDeliveryInvoiceAfterReturn(invoiceNumber: string): void {
   inv.remainingAmount = 0;
 }
 
+/**
+ * قراءة فقط لبيانات العميل والأصناف اللازمة لإنشاء أو تعديل طلب تحضير التوصيل (المرحلة الثانية).
+ * لا تنشئ فاتورة، ولا تستهلك رقم فاتورة، ولا تخصم مخزونًا، ولا تسجل حركة خزنة أو عميل.
+ */
+export function resolveForDeliveryPreparation(input: {
+  customerId?: unknown;
+  lines?: unknown;
+  requireLines?: boolean;
+}): {
+  ok: boolean;
+  error?: string;
+  code?: string;
+  customer?: { id: string; name: string; phone?: string; address?: string; city?: string; zoneId?: string } | null;
+  lines?: { itemId: string; itemName: string; unit: string; quantity: number; unitPrice: number }[];
+} {
+  const modeErr = saleModeViolation({ isPlatformSale: false });
+  if (modeErr) {
+    return { ok: false, error: modeErr.message, code: modeErr.code || 'SALE_MODE_FORBIDDEN' };
+  }
 
+  let customer: { id: string; name: string; phone?: string; address?: string; city?: string; zoneId?: string } | null | undefined = undefined;
+  if (input.customerId !== undefined) {
+    const cid = String(input.customerId ?? '').trim();
+    if (!cid) {
+      customer = null;
+    } else {
+      const found = memoryCustomers.find(c => c.id === cid);
+      if (!found) {
+        return { ok: false, error: 'العميل المختار مش موجود', code: 'CUSTOMER_NOT_FOUND' };
+      }
+      customer = {
+        id: found.id,
+        name: found.name,
+        phone: found.phone,
+        address: found.address,
+        city: found.city,
+        zoneId: (found as any).zoneId
+      };
+    }
+  }
+
+  let resolvedLines: { itemId: string; itemName: string; unit: string; quantity: number; unitPrice: number }[] | undefined = undefined;
+  if (input.lines !== undefined || input.requireLines) {
+    if (!Array.isArray(input.lines) || input.lines.length === 0) {
+      return { ok: false, error: 'أضف صنفًا واحدًا على الأقل في طلب التحضير', code: 'EMPTY_LINES' };
+    }
+    if (input.lines.length > 200) {
+      return { ok: false, error: 'عدد بنود طلب التحضير لا يتجاوز 200 بند', code: 'TOO_MANY_LINES' };
+    }
+    resolvedLines = [];
+    for (let i = 0; i < input.lines.length; i++) {
+      const raw = input.lines[i] as any;
+      const itemId = String(raw?.itemId ?? '').trim();
+      if (!itemId) {
+        return { ok: false, error: `البند رقم ${i + 1}: الصنف مطلوب`, code: 'INVALID_LINE_ITEM' };
+      }
+      const item = memoryItems.find(it => it.id === itemId);
+      if (!item) {
+        return { ok: false, error: `البند رقم ${i + 1}: الصنف المختار مش موجود`, code: 'ITEM_NOT_FOUND' };
+      }
+      if (item.status === 'موقوف') {
+        return { ok: false, error: `الصنف «${item.name}» موقوف ومش متاح للبيع`, code: 'ITEM_INACTIVE' };
+      }
+      const qty = Number(raw?.quantity);
+      if (!Number.isFinite(qty) || qty <= 0 || qty > 1_000_000) {
+        return { ok: false, error: `البند رقم ${i + 1} (${item.name}): الكمية لازم تكون رقم أكبر من صفر`, code: 'INVALID_LINE_QTY' };
+      }
+      resolvedLines.push({
+        itemId: item.id,
+        itemName: item.name,
+        unit: item.unit || 'قطعة',
+        quantity: Math.round(qty * 1000) / 1000,
+        unitPrice: Math.round((Number(item.salePrice) || 0) * 100) / 100
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    customer,
+    lines: resolvedLines
+  };
+}
+
+/** البحث عن فاتورة محفوظة بمفتاح عدم التكرار (idempotencyKey) لاستكمال الربط عند إعادة المحاولة */
+export function findInvoiceByIdempotencyKey(idempotencyKey: string): Invoice | undefined {
+  const key = String(idempotencyKey || '').trim();
+  if (!key) return undefined;
+  const found = memoryInvoices.find(inv => inv.idempotencyKey === key);
+  return found ? { ...found, lines: (found.lines || []).map(l => ({ ...l })) } : undefined;
+}
+
+/** البحث عن فاتورة محفوظة برقم الفاتورة الرسمي */
+export function findInvoiceByNumber(invoiceNumber: string): Invoice | undefined {
+  const num = String(invoiceNumber || '').trim();
+  if (!num) return undefined;
+  const found = memoryInvoices.find(inv => inv.invoiceNumber === num);
+  return found ? { ...found, lines: (found.lines || []).map(l => ({ ...l })) } : undefined;
+}
+
+/** ربط الفاتورة المحفوظة بطلب التحضير وسجل التوصيل بشكل حتمي وتحديث ذاكرة عدم التكرار */
+export function linkInvoiceToPreparation(
+  invoiceNumber: string,
+  link: {
+    preparationId: string;
+    preparationNumber: string;
+    deliveryOrderId?: string;
+  }
+): Invoice | undefined {
+  const num = String(invoiceNumber || '').trim();
+  if (!num) return undefined;
+  const inv = memoryInvoices.find(x => x.invoiceNumber === num);
+  if (!inv) return undefined;
+  inv.preparationId = String(link.preparationId || '').trim().slice(0, 100);
+  inv.preparationNumber = String(link.preparationNumber || '').trim().slice(0, 60);
+  if (link.deliveryOrderId) {
+    inv.deliveryOrderId = String(link.deliveryOrderId).trim().slice(0, 100);
+  }
+  if (inv.idempotencyKey) {
+    setIdempotencyCachedResult('createInvoice', inv.idempotencyKey, inv);
+  }
+  return { ...inv, lines: (inv.lines || []).map(l => ({ ...l })) };
+}

@@ -12,6 +12,7 @@
  */
 import * as D from './delivery.ts';
 import {
+  createInvoice,
   createReturn,
   getInvoiceForDelivery,
   remainingReturnLines,
@@ -19,8 +20,14 @@ import {
   postDeliveryCashboxMovement,
   markDeliveryInvoicesPaid,
   closeDeliveryInvoiceAfterReturn,
+  resolveForDeliveryPreparation,
+  findInvoiceByIdempotencyKey,
+  findInvoiceByNumber,
+  linkInvoiceToPreparation,
   recordAuditLog
 } from './sheetsService.ts';
+import { DIRECT_SALE_PLATFORM_NAME } from './salesRules.ts';
+import type { Invoice } from '../src/types/index.ts';
 
 export interface DeliverySession {
   userId: string;
@@ -307,3 +314,401 @@ export function myOrders(session: DeliverySession): { driver: D.DeliveryDriver; 
     custody: D.driverCustody(driver.id)
   };
 }
+
+// ---------------------------------------------------------------------------
+// طلبات تحضير التوصيل (المرحلة الثانية — تحضير قبل الشحن والفاتورة)
+// ---------------------------------------------------------------------------
+
+export function createPreparationOrder(
+  body: any,
+  session: DeliverySession
+): { order: D.DeliveryPreparationOrder; duplicate?: boolean } {
+  const key = idemKey(body?.idempotencyKey);
+  const existing = D.preparationByKey(key);
+  if (existing) {
+    return { order: existing, duplicate: true };
+  }
+
+  const resolved = resolveForDeliveryPreparation({
+    customerId: body?.customerId ?? '',
+    lines: body?.lines,
+    requireLines: true
+  });
+  if (!resolved.ok) {
+    throw new D.DeliveryError(resolved.error || 'بيانات طلب التحضير غير صالحة', resolved.code || 'INVALID_INPUT');
+  }
+
+  const result = D.createPreparationOrder(
+    { ...body, idempotencyKey: key },
+    { customer: resolved.customer ?? null, lines: resolved.lines },
+    session
+  );
+
+  if (!result.duplicate) {
+    recordAuditLog(
+      who(session),
+      'DELIVERY_PREP_CREATED',
+      'DeliveryPreparationOrder',
+      result.order.number,
+      `إنشاء طلب تحضير توصيل ${result.order.number} للعميل «${result.order.customerName}» (${result.order.lines.length} صنف — إجمالي تقديري ${result.order.estimatedTotal} ج.م)`
+    );
+  }
+  return result;
+}
+
+export function updatePreparationOrder(
+  idOrNumber: string,
+  body: any,
+  session: DeliverySession
+): { order: D.DeliveryPreparationOrder } {
+  const hasCustomerField = body && typeof body === 'object' && 'customerId' in body;
+  const hasLinesField = body && typeof body === 'object' && body.lines !== undefined;
+
+  const resolved = resolveForDeliveryPreparation({
+    customerId: hasCustomerField ? body.customerId : undefined,
+    lines: hasLinesField ? body.lines : undefined,
+    requireLines: false
+  });
+  if (!resolved.ok) {
+    throw new D.DeliveryError(resolved.error || 'بيانات تعديل طلب التحضير غير صالحة', resolved.code || 'INVALID_INPUT');
+  }
+
+  const order = D.updatePreparationOrder(
+    idOrNumber,
+    body,
+    {
+      customer: hasCustomerField ? (resolved.customer ?? null) : undefined,
+      lines: hasLinesField ? resolved.lines : undefined
+    },
+    session
+  );
+
+  recordAuditLog(
+    who(session),
+    'DELIVERY_PREP_UPDATED',
+    'DeliveryPreparationOrder',
+    order.number,
+    `تعديل طلب تحضير توصيل ${order.number} (المراجعة ${order.revision}) للعميل «${order.customerName}» (${order.lines.length} صنف — إجمالي تقديري ${order.estimatedTotal} ج.م)`
+  );
+  return { order };
+}
+
+export function cancelPreparationOrder(
+  idOrNumber: string,
+  body: any,
+  session: DeliverySession
+): { order: D.DeliveryPreparationOrder } {
+  const order = D.cancelPreparationOrder(
+    idOrNumber,
+    { reason: body?.reason, revision: body?.revision },
+    session
+  );
+
+  recordAuditLog(
+    who(session),
+    'DELIVERY_PREP_CANCELLED',
+    'DeliveryPreparationOrder',
+    order.number,
+    `إلغاء طلب تحضير توصيل ${order.number} قبل الشحن${order.cancelReason ? ` — السبب: ${order.cancelReason}` : ''}`
+  );
+  return { order };
+}
+
+/**
+ * المرحلة الثالثة: إرسال طلب تحضير قائم للشحن، وإصدار فاتورة البيع الرسمية وربطها بالطلب وسجل التوصيل.
+ * - يتطلب وجود طيار أو شركة شحن صالحة ونشطة حسب إعدادات التوصيل الحالية.
+ * - يعيد التحقق من الأصناف والكميات والمخزون المتاح فعليًا وقت الشحن.
+ * - يستخدم مفتاح عدم تكرار حتمي مشتق من هوية طلب التحضير (`delivery-prep-dispatch:<prep.id>`).
+ * - في حال انقطاع التنفيذ بعد `createInvoice` وقبل ربط طلب التحضير، تستعيد إعادة المحاولة الفاتورة الموجودة وتستكمل الربط دون تكرار الفاتورة أو خصم المخزون أو إنشاء `DeliveryOrder` ثانٍ.
+ */
+export async function dispatchPreparationOrder(
+  idOrNumber: string,
+  body: any,
+  session: DeliverySession,
+  options?: { simulateInterruptAfterInvoice?: boolean }
+): Promise<{
+  order: D.DeliveryPreparationOrder;
+  invoice: Invoice;
+  deliveryOrder: D.DeliveryOrder;
+  duplicate?: boolean;
+  recovered?: boolean;
+}> {
+  const src = body && typeof body === 'object' ? body : {};
+  const { order: prep, alreadyDispatched, dispatchIdempotencyKey } = D.beginPreparationDispatch(
+    idOrNumber,
+    { revision: src.revision }
+  );
+
+  try {
+    let existingInvoice =
+      findInvoiceByIdempotencyKey(dispatchIdempotencyKey) ||
+      (prep.invoiceNumber ? findInvoiceByNumber(prep.invoiceNumber) : undefined);
+
+    if (alreadyDispatched && existingInvoice) {
+      let existingDeliveryOrder =
+        (prep.deliveryOrderId ? D.getOrder(prep.deliveryOrderId) : undefined) ||
+        D.findOrderForInvoice(existingInvoice.invoiceNumber);
+
+      if (existingDeliveryOrder) {
+        existingDeliveryOrder =
+          D.linkOrderToPreparation(existingDeliveryOrder.id, {
+            id: prep.id,
+            number: prep.number
+          }) || existingDeliveryOrder;
+        if (existingDeliveryOrder.status === 'جديد' && existingDeliveryOrder.assigneeId) {
+          existingDeliveryOrder = D.applyTransition(
+            existingDeliveryOrder.id,
+            'خرج للتوصيل',
+            session,
+            { note: `شحن طلب التحضير ${prep.number} وإصدار الفاتورة ${existingInvoice.invoiceNumber}` }
+          ).order;
+        }
+      }
+
+      existingInvoice =
+        linkInvoiceToPreparation(existingInvoice.invoiceNumber, {
+          preparationId: prep.id,
+          preparationNumber: prep.number,
+          deliveryOrderId: existingDeliveryOrder?.id
+        }) || existingInvoice;
+
+      if (!existingDeliveryOrder) {
+        throw new D.DeliveryError('سجل التوصيل المرتبط بالفاتورة غير موجود', 'DELIVERY_ORDER_NOT_FOUND', 404);
+      }
+
+      return {
+        order: prep,
+        invoice: existingInvoice,
+        deliveryOrder: existingDeliveryOrder,
+        duplicate: true
+      };
+    }
+
+    const assigneeType = String(
+      src.assigneeType !== undefined && String(src.assigneeType).trim() !== ''
+        ? src.assigneeType
+        : prep.assigneeType || ''
+    ).trim();
+    const assigneeId = String(
+      src.assigneeId !== undefined && String(src.assigneeId).trim() !== ''
+        ? src.assigneeId
+        : prep.assigneeId || ''
+    ).trim();
+    const trackingNumber = String(
+      src.trackingNumber !== undefined ? src.trackingNumber : prep.trackingNumber || ''
+    ).trim();
+
+    if ((assigneeType !== 'driver' && assigneeType !== 'courier') || !assigneeId) {
+      throw new D.DeliveryError(
+        'لازم تختار طيار أو شركة شحن نشطة قبل إرسال طلب التحضير للشحن',
+        'ASSIGNEE_REQUIRED',
+        400
+      );
+    }
+
+    const resolvedCustomer = prep.customerId
+      ? resolveForDeliveryPreparation({ customerId: prep.customerId, requireLines: false })
+      : { ok: true, customer: null };
+    if (!resolvedCustomer.ok) {
+      throw new D.DeliveryError(
+        resolvedCustomer.error || 'بيانات العميل غير صالحة',
+        resolvedCustomer.code || 'CUSTOMER_NOT_FOUND',
+        400
+      );
+    }
+
+    const deliveryPlanInput = {
+      paymentMode: prep.paymentMode,
+      address: prep.address,
+      phone: prep.phone,
+      zoneId: prep.zoneId || undefined,
+      fee: prep.feeManual ? prep.fee : undefined,
+      preserveManualFee: prep.feeManual,
+      assigneeType,
+      assigneeId,
+      trackingNumber,
+      preparationId: prep.id,
+      preparationNumber: prep.number
+    };
+
+    const plan = D.prepareDeliveryPlan(deliveryPlanInput, {
+      isDirectSale: true,
+      actor: session,
+      customer:
+        resolvedCustomer.customer ??
+        (prep.customerId
+          ? {
+              id: prep.customerId,
+              name: prep.customerName,
+              phone: prep.phone,
+              address: prep.address,
+              zoneId: prep.zoneId
+            }
+          : null),
+      customerName: prep.customerName
+    });
+
+    if (!plan.assignee) {
+      throw new D.DeliveryError(
+        'لازم تختار طيار أو شركة شحن نشطة قبل إرسال طلب التحضير للشحن',
+        'ASSIGNEE_REQUIRED',
+        400
+      );
+    }
+
+    D.checkPlanTotals(plan, prep.itemsSubtotal);
+
+    const hadInvoiceBeforeCall = Boolean(existingInvoice);
+    const dispatchNotes = src.notes !== undefined ? String(src.notes ?? '') : prep.notes;
+
+    const invRes = await createInvoice(
+      {
+        idempotencyKey: dispatchIdempotencyKey,
+        preparationId: prep.id,
+        preparationNumber: prep.number,
+        platform: DIRECT_SALE_PLATFORM_NAME,
+        customerId: prep.customerId || undefined,
+        customerName: prep.customerName || undefined,
+        warehouseId: src.warehouseId ? String(src.warehouseId) : undefined,
+        cashboxId: src.cashboxId ? String(src.cashboxId) : undefined,
+        paymentType: prep.paymentMode === 'cod' ? 'آجل' : 'نقدي',
+        creditPartyType: prep.paymentMode === 'cod' ? 'delivery' : undefined,
+        paymentMethod: src.paymentMethod ? String(src.paymentMethod) : undefined,
+        paidAmount: src.paidAmount !== undefined ? Number(src.paidAmount) : undefined,
+        referenceNumber: src.referenceNumber ? String(src.referenceNumber) : undefined,
+        notes: dispatchNotes,
+        lines: prep.lines.map(l => ({
+          itemId: l.itemId,
+          itemNameAtSale: l.itemName,
+          quantity: l.quantity,
+          salePriceAtSale: l.unitPrice,
+          baseUnitPrice: l.unitPrice
+        })),
+        delivery: deliveryPlanInput
+      },
+      session as any
+    );
+
+    if (!invRes.success || !invRes.invoice) {
+      const errCode = String((invRes as any).code || 'INVOICE_CREATE_FAILED');
+      const rawStatus = Number((invRes as any).statusCode) || (errCode === 'INSUFFICIENT_STOCK' ? 409 : 400);
+      const statusCode = errCode === 'INSUFFICIENT_STOCK' ? 409 : rawStatus;
+      throw new D.DeliveryError(
+        invRes.error || 'تعذر إصدار فاتورة البيع لطلب التحضير',
+        errCode,
+        statusCode
+      );
+    }
+
+    if (options?.simulateInterruptAfterInvoice) {
+      throw new Error('SIMULATED_INTERRUPT_AFTER_INVOICE');
+    }
+
+    const invoice = invRes.invoice;
+    const wasRecovered = Boolean(hadInvoiceBeforeCall || (invRes as any).duplicate) && !alreadyDispatched;
+
+    let deliveryOrder =
+      (invoice.deliveryOrderId ? D.getOrder(invoice.deliveryOrderId) : undefined) ||
+      D.findOrderForInvoice(invoice.invoiceNumber);
+
+    if (!deliveryOrder) {
+      deliveryOrder = D.createOrderForInvoice(
+        plan,
+        {
+          invoiceNumber: invoice.invoiceNumber,
+          total: invoice.netAmount,
+          preparationId: prep.id,
+          preparationNumber: prep.number
+        },
+        session
+      );
+    }
+
+    deliveryOrder =
+      D.linkOrderToPreparation(deliveryOrder.id, {
+        id: prep.id,
+        number: prep.number
+      }) || deliveryOrder;
+
+    if (
+      !deliveryOrder.assigneeId ||
+      (deliveryOrder.status === 'جديد' &&
+        (deliveryOrder.assigneeType !== plan.assignee.type ||
+          deliveryOrder.assigneeId !== plan.assignee.id ||
+          deliveryOrder.trackingNumber !== plan.trackingNumber))
+    ) {
+      deliveryOrder = D.assignOrder(
+        deliveryOrder.id,
+        {
+          assigneeType: plan.assignee.type,
+          assigneeId: plan.assignee.id,
+          trackingNumber: plan.trackingNumber
+        },
+        session
+      ).order;
+    }
+
+    if (deliveryOrder.status === 'جديد') {
+      D.checkTransition(deliveryOrder.id, 'خرج للتوصيل');
+      deliveryOrder = D.applyTransition(
+        deliveryOrder.id,
+        'خرج للتوصيل',
+        session,
+        { note: `شحن طلب التحضير ${prep.number} وإصدار الفاتورة ${invoice.invoiceNumber}` }
+      ).order;
+    }
+
+    const linkedInvoice =
+      linkInvoiceToPreparation(invoice.invoiceNumber, {
+        preparationId: prep.id,
+        preparationNumber: prep.number,
+        deliveryOrderId: deliveryOrder.id
+      }) || invoice;
+
+    const updatedPrep = D.completePreparationDispatch(
+      prep.id,
+      {
+        invoiceNumber: linkedInvoice.invoiceNumber,
+        deliveryOrderId: deliveryOrder.id,
+        deliveryOrderNumber: deliveryOrder.number,
+        dispatchIdempotencyKey,
+        assigneeType: deliveryOrder.assigneeType as D.AssigneeType,
+        assigneeId: deliveryOrder.assigneeId,
+        assigneeName: deliveryOrder.assigneeName,
+        trackingNumber: deliveryOrder.trackingNumber,
+        fee: deliveryOrder.fee,
+        feeManual: deliveryOrder.feeManual,
+        zoneId: deliveryOrder.zoneId,
+        zoneName: deliveryOrder.zoneName,
+        zoneCommission: deliveryOrder.zoneCommission,
+        notes: src.notes !== undefined ? dispatchNotes : undefined
+      },
+      session
+    );
+
+    recordAuditLog(
+      who(session),
+      'DELIVERY_PREP_DISPATCHED',
+      'DeliveryPreparationOrder',
+      updatedPrep.number,
+      `شحن طلب التحضير ${updatedPrep.number} وإصدار الفاتورة ${linkedInvoice.invoiceNumber} وسجل التوصيل ${deliveryOrder.number} (${deliveryOrder.assigneeName} — ${linkedInvoice.netAmount} ج.م)${
+        wasRecovered ? ' [استكمال ربط بعد إعادة محاولة]' : ''
+      }`
+    );
+
+    return {
+      order: updatedPrep,
+      invoice: linkedInvoice,
+      deliveryOrder,
+      ...(wasRecovered ? { duplicate: true, recovered: true } : {})
+    };
+  } catch (err) {
+    // إذا فشل التحقق أو إصدار الفاتورة قبل إنشاء أي فاتورة في الذاكرة، نعيد طلب التحضير لحالته القابلة للتعديل «قيد التحضير»
+    const createdInv = findInvoiceByIdempotencyKey(dispatchIdempotencyKey);
+    if (!createdInv && !alreadyDispatched) {
+      D.revertPreparationDispatch(prep.id);
+    }
+    throw err;
+  }
+}
+

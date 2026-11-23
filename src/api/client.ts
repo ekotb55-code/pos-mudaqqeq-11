@@ -87,6 +87,14 @@ import {
   DeliveryAssignOrderResponse,
   DeliveryChangeOrderStatusPayload,
   DeliveryChangeOrderStatusResponse,
+  CreateDeliveryPreparationPayload,
+  UpdateDeliveryPreparationPayload,
+  CancelDeliveryPreparationPayload,
+  DispatchDeliveryPreparationPayload,
+  DispatchDeliveryPreparationResponse,
+  DeliveryPreparationOrdersListParams,
+  DeliveryPreparationOrderResponse,
+  DeliveryPreparationOrdersListResponse,
   DeliveryAssigneeType,
   DeliverySettlementPreviewResponse,
   DeliverySettlePayload,
@@ -2855,6 +2863,103 @@ export const api = {
   ): Promise<DeliveryChangeOrderStatusResponse> {
     return request<DeliveryChangeOrderStatusResponse>(
       `/api/delivery/orders/${encodeURIComponent(orderId)}/status`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      }
+    );
+  },
+
+  // Delivery Preparation Orders (Phase 2 — online-only preparation before shipping & invoice)
+  async getDeliveryPreparationOrders(
+    params: DeliveryPreparationOrdersListParams = {}
+  ): Promise<DeliveryPreparationOrdersListResponse> {
+    const query = new URLSearchParams();
+    if (params.status) query.set('status', params.status);
+    if (params.customerId) query.set('customerId', params.customerId);
+    if (params.zoneId) query.set('zoneId', params.zoneId);
+    if (params.from) query.set('from', params.from);
+    if (params.to) query.set('to', params.to);
+    if (params.open) query.set('open', '1');
+    const qs = query.toString() ? `?${query.toString()}` : '';
+    return request<DeliveryPreparationOrdersListResponse>(`/api/delivery/preparations${qs}`);
+  },
+
+  async getDeliveryPreparationOrder(orderId: string): Promise<DeliveryPreparationOrderResponse> {
+    return request<DeliveryPreparationOrderResponse>(
+      `/api/delivery/preparations/${encodeURIComponent(orderId)}`
+    );
+  },
+
+  async createDeliveryPreparationOrder(
+    payload: CreateDeliveryPreparationPayload
+  ): Promise<DeliveryPreparationOrderResponse> {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      const err = new Error(
+        'لا يمكن إنشاء أو تعديل طلب تحضير التوصيل بدون اتصال بالإنترنت (العملية تتطلب اتصالاً مباشراً بالخادم ولا تُحفظ في طابور الأوفلاين)'
+      ) as Error & { code?: string };
+      err.code = 'DELIVERY_PREP_OFFLINE_FORBIDDEN';
+      throw err;
+    }
+    return request<DeliveryPreparationOrderResponse>('/api/delivery/preparations', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async updateDeliveryPreparationOrder(
+    orderId: string,
+    payload: UpdateDeliveryPreparationPayload
+  ): Promise<DeliveryPreparationOrderResponse> {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      const err = new Error(
+        'لا يمكن إنشاء أو تعديل طلب تحضير التوصيل بدون اتصال بالإنترنت (العملية تتطلب اتصالاً مباشراً بالخادم ولا تُحفظ في طابور الأوفلاين)'
+      ) as Error & { code?: string };
+      err.code = 'DELIVERY_PREP_OFFLINE_FORBIDDEN';
+      throw err;
+    }
+    return request<DeliveryPreparationOrderResponse>(
+      `/api/delivery/preparations/${encodeURIComponent(orderId)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload)
+      }
+    );
+  },
+
+  async cancelDeliveryPreparationOrder(
+    orderId: string,
+    payload: CancelDeliveryPreparationPayload = {}
+  ): Promise<DeliveryPreparationOrderResponse> {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      const err = new Error(
+        'لا يمكن إنشاء أو تعديل طلب تحضير التوصيل بدون اتصال بالإنترنت (العملية تتطلب اتصالاً مباشراً بالخادم ولا تُحفظ في طابور الأوفلاين)'
+      ) as Error & { code?: string };
+      err.code = 'DELIVERY_PREP_OFFLINE_FORBIDDEN';
+      throw err;
+    }
+    return request<DeliveryPreparationOrderResponse>(
+      `/api/delivery/preparations/${encodeURIComponent(orderId)}/cancel`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      }
+    );
+  },
+
+  async dispatchDeliveryPreparationOrder(
+    orderId: string,
+    payload: DispatchDeliveryPreparationPayload = {}
+  ): Promise<DispatchDeliveryPreparationResponse> {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      const err = new Error(
+        'لا يمكن شحن طلب تحضير التوصيل أو إصدار فاتورته بدون اتصال بالإنترنت (العملية تتطلب اتصالاً مباشراً بالخادم ولا تُحفظ في طابور الأوفلاين)'
+      ) as Error & { code?: string };
+      err.code = 'DELIVERY_PREP_OFFLINE_FORBIDDEN';
+      throw err;
+    }
+    return request<DispatchDeliveryPreparationResponse>(
+      `/api/delivery/preparations/${encodeURIComponent(orderId)}/dispatch`,
       {
         method: 'POST',
         body: JSON.stringify(payload)

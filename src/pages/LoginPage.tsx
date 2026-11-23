@@ -175,8 +175,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({
       setError(
         err.message ||
           (lang === 'ar'
-            ? 'فشل تسجيل الدخول، تأكد من صحة اسم المستخدم وكلمة المرور'
-            : 'Login failed. Please check your username and password')
+            ? 'اسم المستخدم أو كلمة المرور غير صحيحة'
+            : 'Invalid username or password')
       );
     } finally {
       setIsLoading(false);

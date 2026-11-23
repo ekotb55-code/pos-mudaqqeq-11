@@ -207,12 +207,14 @@ function persistCachedSalesRules(rules?: SalesRules | null) {
 }
 
 function haveUserPermissionsOrIdentityChanged(prev: UserAccount, next: UserAccount): boolean {
+  const prevStatus = prev.status || 'active';
+  const nextStatus = next.status || 'active';
   if (
     prev.id !== next.id ||
     prev.role !== next.role ||
     Boolean(prev.isOwner) !== Boolean(next.isOwner) ||
     Boolean(prev.mustChangePassword) !== Boolean(next.mustChangePassword) ||
-    prev.status !== next.status ||
+    prevStatus !== nextStatus ||
     prev.name !== next.name ||
     prev.username !== next.username
   ) {
@@ -422,6 +424,16 @@ export default function App() {
     },
     salesRules: bootCachedRules
   });
+
+  const salesRulesRef = useRef<SalesRules | undefined>(config.salesRules);
+  salesRulesRef.current = config.salesRules;
+
+  const userRef = useRef<UserAccount | null>(user);
+  userRef.current = user;
+
+  const loadDataInFlightRef = useRef<Promise<void> | null>(null);
+  const lastMeCheckAtRef = useRef<number>(0);
+  const meCheckInFlightRef = useRef<boolean>(false);
 
   const featureFlags = useMemo<FeatureModeFlags>(() => {
     const sr = config.salesRules;
@@ -777,11 +789,11 @@ export default function App() {
     if (snapshot.invoices.length > 0) setInvoices(snapshot.invoices);
     if (snapshot.returns.length > 0) setReturns(snapshot.returns);
 
-    let effectiveSalesRules = config.salesRules;
+    let effectiveSalesRules = salesRulesRef.current;
     if (snapshot.settings) {
       const s = snapshot.settings;
       if (s.salesRules) {
-        effectiveSalesRules = { ...config.salesRules, ...s.salesRules };
+        effectiveSalesRules = { ...salesRulesRef.current, ...s.salesRules };
         persistCachedSalesRules(s.salesRules);
       }
       setConfig(prev => ({
@@ -839,7 +851,7 @@ export default function App() {
     }
     setIsAuthPermissionsVerified(true);
     return true;
-  }, [config.salesRules]);
+  }, []);
 
   // Handle session expiry & cross-tab user-switch mismatch from API interceptor (لا يوقف البيع أثناء انقطاع الإنترنت)
   useEffect(() => {
@@ -1036,18 +1048,30 @@ export default function App() {
     recordUserInteraction();
   }, [user?.id]);
 
+  const activeUserId = user?.id ?? null;
+  const activeMustChangePassword = Boolean(user?.mustChangePassword);
+
   useEffect(() => {
-    if (!user) return;
+    const currentUser = userRef.current;
+    if (!currentUser || !activeUserId) return;
     const timeoutMs = inactivityTimeoutMinutes * 60 * 1000;
     const isOfflineTok =
       localStorage.getItem('pos_session_offline') === 'true' ||
       Boolean(localStorage.getItem('pos_token')?.startsWith('offline_'));
 
     const syncMeStatus = () => {
-      if (!isOnline || isOfflineTok) return;
+      const liveUser = userRef.current;
+      if (!liveUser || !isOnline || isOfflineTok) return;
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      if (loadDataInFlightRef.current || meCheckInFlightRef.current) return;
+      if (Date.now() - lastMeCheckAtRef.current < 5_000) return;
+
+      meCheckInFlightRef.current = true;
+      lastMeCheckAtRef.current = Date.now();
       api.getMe({ background: true })
         .then((res) => {
+          const curUser = userRef.current;
+          if (!curUser) return;
           if (res?.success && res.user) {
             if (res.user.status === 'inactive' || res.user.status === 'موقوف') {
               const bound = getBoundSessionIdentity();
@@ -1073,9 +1097,9 @@ export default function App() {
               return;
             }
             const nextMustChange = Boolean(res.user.mustChangePassword);
-            const updated: UserAccount = { ...user, ...res.user, mustChangePassword: nextMustChange };
+            const updated: UserAccount = { ...curUser, ...res.user, mustChangePassword: nextMustChange };
             delete (updated as any).password;
-            if (haveUserPermissionsOrIdentityChanged(user, updated)) {
+            if (haveUserPermissionsOrIdentityChanged(curUser, updated)) {
               setUser(updated);
               localStorage.setItem('pos_user', JSON.stringify(updated));
             }
@@ -1095,10 +1119,11 @@ export default function App() {
             });
           }
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => {
+          meCheckInFlightRef.current = false;
+        });
     };
-
-    syncMeStatus();
 
     let lastSessionPollAt = Date.now();
     const intervalId = window.setInterval(() => {
@@ -1192,39 +1217,48 @@ export default function App() {
       window.clearInterval(intervalId);
       window.removeEventListener('focus', handleWindowFocus);
     };
-  }, [user, isOnline, inactivityTimeoutMinutes]);
+  }, [activeUserId, activeMustChangePassword, isOnline, inactivityTimeoutMinutes]);
 
-  // Fetch initial config & data
+  // Fetch initial config & data (مع حماية single-flight لمنع تكرار الدفعات المتزامنة)
   const loadData = useCallback(async () => {
-    if (user?.mustChangePassword) {
-      setIsAuthPermissionsVerified(true);
-      setIsSyncing(false);
-      return;
+    if (loadDataInFlightRef.current) {
+      return loadDataInFlightRef.current;
     }
-    setIsSyncing(true);
 
-    const isOfflineNow =
-      typeof navigator !== 'undefined' && navigator.onLine === false;
-    const isOfflineSessionToken =
-      localStorage.getItem('pos_session_offline') === 'true' ||
-      Boolean(localStorage.getItem('pos_token')?.startsWith('offline_'));
-
-    // إذا كان المتصفح أوفلاين عند الفتح أو الجلسة محلية أوفلاين، نقرأ النسخة المحلية فورًا من IndexedDB ونتحقق من الصلاحيات المشفرة
-    if (user && (isOfflineNow || isOfflineSessionToken)) {
-      await hydrateFromOfflineDb(user);
-      if (isOfflineNow) {
+    const runLoad = async () => {
+      const currentUser = userRef.current;
+      if (currentUser?.mustChangePassword) {
+        setIsAuthPermissionsVerified(true);
         setIsSyncing(false);
         return;
       }
-    }
+      setIsSyncing(true);
 
-    try {
-      const [configData, meRes] = await Promise.all([
-        api.getConfig(),
-        user && !isOfflineSessionToken
-          ? api.getMe({ background: true }).catch(() => null)
-          : Promise.resolve(null)
-      ]);
+      const isOfflineNow =
+        typeof navigator !== 'undefined' && navigator.onLine === false;
+      const isOfflineSessionToken =
+        localStorage.getItem('pos_session_offline') === 'true' ||
+        Boolean(localStorage.getItem('pos_token')?.startsWith('offline_'));
+
+      // إذا كان المتصفح أوفلاين عند الفتح أو الجلسة محلية أوفلاين، نقرأ النسخة المحلية فورًا من IndexedDB ونتحقق من الصلاحيات المشفرة
+      if (currentUser && (isOfflineNow || isOfflineSessionToken)) {
+        await hydrateFromOfflineDb(currentUser);
+        if (isOfflineNow) {
+          setIsSyncing(false);
+          return;
+        }
+      }
+
+      try {
+        if (currentUser && !isOfflineSessionToken) {
+          lastMeCheckAtRef.current = Date.now();
+        }
+        const [configData, meRes] = await Promise.all([
+          api.getConfig(),
+          currentUser && !isOfflineSessionToken
+            ? api.getMe({ background: true }).catch(() => null)
+            : Promise.resolve(null)
+        ]);
       if (configData.salesRules) {
         persistCachedSalesRules(configData.salesRules);
       }
@@ -1260,8 +1294,8 @@ export default function App() {
       }
 
       // التحقق الفوري من حالة المستخدم وصلاحياته من الخادم قبل عرض أو تحميل أي بيانات محمية
-      let effectiveUser: UserAccount | null = user;
-      if (user && meRes?.success && meRes.user) {
+      let effectiveUser: UserAccount | null = currentUser;
+      if (currentUser && meRes?.success && meRes.user) {
         if (meRes.user.status === 'inactive' || meRes.user.status === 'موقوف') {
           const bound = getBoundSessionIdentity();
           setBoundSessionIdentity(null);
@@ -1286,20 +1320,20 @@ export default function App() {
           return;
         }
         const verifiedUser: UserAccount = {
-          ...user,
+          ...currentUser,
           ...meRes.user,
           mustChangePassword: Boolean(meRes.user.mustChangePassword)
         };
         delete (verifiedUser as any).password;
         effectiveUser = verifiedUser;
         localStorage.setItem('pos_user', JSON.stringify(verifiedUser));
-        if (haveUserPermissionsOrIdentityChanged(user, verifiedUser)) {
+        if (haveUserPermissionsOrIdentityChanged(currentUser, verifiedUser)) {
           setUser(verifiedUser);
         }
       }
 
       if (effectiveUser) {
-        const effectiveRules = configData.salesRules ?? config.salesRules;
+        const effectiveRules = configData.salesRules ?? salesRulesRef.current;
         const verifiedSalesOnly = Boolean(effectiveRules?.salesOnlyMode);
         const verifiedFlags: FeatureModeFlags = {
           salesOnlyMode: verifiedSalesOnly,
@@ -1551,7 +1585,7 @@ export default function App() {
             delete (updatedSessionUser as any).password;
             effectiveUser = updatedSessionUser;
             localStorage.setItem('pos_user', JSON.stringify(updatedSessionUser));
-            if (haveUserPermissionsOrIdentityChanged(user!, updatedSessionUser)) {
+            if (currentUser && haveUserPermissionsOrIdentityChanged(currentUser, updatedSessionUser)) {
               setUser(updatedSessionUser);
             }
           }
@@ -1621,17 +1655,25 @@ export default function App() {
           }));
         })
         .catch(() => {});
-    } catch (err) {
-      console.error('Failed to load initial data:', err);
-      if (user) {
-        await hydrateFromOfflineDb(user);
-      } else {
-        setIsAuthPermissionsVerified(true);
+      } catch (err) {
+        console.error('Failed to load initial data:', err);
+        const fallbackUser = userRef.current;
+        if (fallbackUser) {
+          await hydrateFromOfflineDb(fallbackUser);
+        } else {
+          setIsAuthPermissionsVerified(true);
+        }
+      } finally {
+        setIsSyncing(false);
       }
-    } finally {
-      setIsSyncing(false);
-    }
-  }, [user, hydrateFromOfflineDb, config.salesRules]);
+    };
+
+    const inFlight = runLoad().finally(() => {
+      loadDataInFlightRef.current = null;
+    });
+    loadDataInFlightRef.current = inFlight;
+    return inFlight;
+  }, [activeUserId, activeMustChangePassword, hydrateFromOfflineDb]);
 
   useEffect(() => {
     loadData();

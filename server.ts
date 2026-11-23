@@ -7,7 +7,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
-import { getSystemConfig, setAppsScriptUrl } from './server/config.ts';
+import { getSystemConfig, resolveServerPort, setAppsScriptUrl } from './server/config.ts';
 import {
   testConnection,
   setupSheets,
@@ -834,12 +834,8 @@ function handleCatchError(res: Response, err: any, fallbackMessage = 'حدث خ�
 export async function createServerApp(options?: { attachVite?: boolean; persistenceTransport?: RpcTransport; persistenceTenant?: string; imageStorage?: ImageStorage | null }) {
   const app = express();
   const httpServer = http.createServer(app);
-  // منفذ 3000 الإلزامي للعمل داخل بيئة AI Studio iFrame
-const PORT = Number(process.env.PORT || 3000);
-
-if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
-  throw new Error(`قيمة PORT غير صالحة: ${process.env.PORT}`);
-}
+  // قراءة المنفذ من متغير البيئة PORT (عدد صحيح 1..65535) مع إبقاء 3000 قيمة افتراضية
+  const PORT = resolveServerPort(process.env.PORT, 3000);
 
   // ترويسات الأمان عبر helmet بإعدادات متوافقة مع iFrame والواجهة والخطوط والطباعة
   app.set('trust proxy', 1);
@@ -4366,6 +4362,102 @@ if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
     delivery.saveDriver(body, (userId) => ((usersCollection.get() || []) as any[]).some((u) => String(u.id) === userId))
   );
   deliveryMasterRoute('/api/delivery/couriers', 'شركة شحن', (body) => delivery.saveCourier(body));
+
+  // طلبات تحضير التوصيل (المرحلة الثانية — تحضير قبل الشحن والفاتورة)
+  app.get(
+    '/api/delivery/preparations',
+    requireAnyPermission(['delivery.view', 'delivery.manage', 'invoices.create']) as any,
+    (req: AuthenticatedRequest, res: Response) => {
+      try {
+        const q = req.query as Record<string, string>;
+        const orders = delivery.listPreparationOrders({
+          status: q.status || undefined,
+          customerId: q.customerId || undefined,
+          zoneId: q.zoneId || undefined,
+          from: q.from || undefined,
+          to: q.to || undefined,
+          open: q.open === '1' || q.open === 'true'
+        });
+        res.json({ success: true, orders });
+      } catch (err: any) {
+        sendDeliveryError(res, err, 'تعذر تحميل طلبات تحضير التوصيل');
+      }
+    }
+  );
+
+  app.get(
+    '/api/delivery/preparations/:id',
+    requireAnyPermission(['delivery.view', 'delivery.manage', 'invoices.create']) as any,
+    (req: AuthenticatedRequest, res: Response) => {
+      try {
+        const order = delivery.getPreparationOrder(req.params.id);
+        if (!order) {
+          res.status(404).json({ success: false, code: 'NOT_FOUND', error: 'طلب التحضير مش موجود' });
+          return;
+        }
+        res.json({ success: true, order });
+      } catch (err: any) {
+        sendDeliveryError(res, err, 'تعذر تحميل طلب تحضير التوصيل');
+      }
+    }
+  );
+
+  app.post(
+    '/api/delivery/preparations',
+    requireAnyPermission(['invoices.create', 'delivery.manage']) as any,
+    (req: AuthenticatedRequest, res: Response) => {
+      try {
+        const result = deliveryService.createPreparationOrder(req.body || {}, deliverySessionOf(req));
+        res.json({ success: true, ...result });
+      } catch (err: any) {
+        sendDeliveryError(res, err, 'تعذر إنشاء طلب تحضير التوصيل');
+      }
+    }
+  );
+
+  app.put(
+    '/api/delivery/preparations/:id',
+    requireAnyPermission(['invoices.create', 'delivery.manage']) as any,
+    (req: AuthenticatedRequest, res: Response) => {
+      try {
+        const result = deliveryService.updatePreparationOrder(req.params.id, req.body || {}, deliverySessionOf(req));
+        res.json({ success: true, ...result });
+      } catch (err: any) {
+        sendDeliveryError(res, err, 'تعذر تعديل طلب تحضير التوصيل');
+      }
+    }
+  );
+
+  app.post(
+    '/api/delivery/preparations/:id/cancel',
+    requireAnyPermission(['invoices.create', 'delivery.manage']) as any,
+    (req: AuthenticatedRequest, res: Response) => {
+      try {
+        const result = deliveryService.cancelPreparationOrder(req.params.id, req.body || {}, deliverySessionOf(req));
+        res.json({ success: true, ...result });
+      } catch (err: any) {
+        sendDeliveryError(res, err, 'تعذر إلغاء طلب تحضير التوصيل');
+      }
+    }
+  );
+
+  app.post(
+    '/api/delivery/preparations/:id/dispatch',
+    requirePermission('invoices.create') as any,
+    requirePermission('delivery.manage') as any,
+    async (req: AuthenticatedRequest, res: Response) => {
+      try {
+        const result = await deliveryService.dispatchPreparationOrder(
+          req.params.id,
+          req.body || {},
+          deliverySessionOf(req)
+        );
+        res.json({ success: true, ...result });
+      } catch (err: any) {
+        sendDeliveryError(res, err, 'تعذر شحن طلب التحضير وإصدار الفاتورة');
+      }
+    }
+  );
 
   // شاشة «التوصيل»: كل الطلبات
   app.get('/api/delivery/orders', requirePermission('delivery.view') as any, (req: AuthenticatedRequest, res: Response) => {

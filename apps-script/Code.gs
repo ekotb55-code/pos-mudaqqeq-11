@@ -376,41 +376,14 @@ function ensureDefaultUsersIfEmptyGS(ss, log) {
 }
 
 /**
- * فحص وتتبع محاولات الدخول الخاطئة وقفل الحساب مؤقتاً بعد 5 محاولات فاشلة
+ * مسح أي أقفال مؤقتة سابقة في CacheService من الإصدارات القديمة (تم إلغاء قفل الحساب بعد المحاولات الخاطئة)
  */
-function checkLoginRateLimit(normUser) {
-  var cache = CacheService.getScriptCache();
-  var lockKey = 'LOCKOUT_' + normUser;
-  var lockedUntil = cache.get(lockKey);
-  if (lockedUntil) {
-    var remSeconds = Math.max(1, Math.ceil((Number(lockedUntil) - Date.now()) / 1000));
-    var remMinutes = Math.ceil(remSeconds / 60);
-    return { locked: true, remainingMinutes: remMinutes };
-  }
-  return { locked: false };
-}
-
-function recordFailedLogin(normUser) {
-  var cache = CacheService.getScriptCache();
-  var countKey = 'FAIL_COUNT_' + normUser;
-  var currentCount = Number(cache.get(countKey) || 0) + 1;
-
-  if (currentCount >= 5) {
-    var lockKey = 'LOCKOUT_' + normUser;
-    var unlockTime = Date.now() + (15 * 60 * 1000); // 15 دقيقة
-    cache.put(lockKey, String(unlockTime), 900); // 900 ثانية
-    cache.remove(countKey);
-    return { lockedNow: true, remainingMinutes: 15 };
-  } else {
-    cache.put(countKey, String(currentCount), 900);
-    return { lockedNow: false, triesLeft: 5 - currentCount };
-  }
-}
-
-function clearFailedLogins(normUser) {
-  var cache = CacheService.getScriptCache();
-  cache.remove('LOCKOUT_' + normUser);
-  cache.remove('FAIL_COUNT_' + normUser);
+function clearLegacyLoginLockCache(normUser) {
+  try {
+    var cache = CacheService.getScriptCache();
+    cache.remove('LOCKOUT_' + normUser);
+    cache.remove('FAIL_COUNT_' + normUser);
+  } catch (_) {}
 }
 
 /**
@@ -1754,14 +1727,8 @@ function verifyLogin(usernameInput, password, offlineVerifierData) {
     return { success: false, error: 'يرجى إدخال اسم المستخدم وكلمة المرور' };
   }
 
-  // فحص الحظر المؤقت بعد 5 محاولات خاطئة
-  var rateCheck = checkLoginRateLimit(normUser);
-  if (rateCheck.locked) {
-    return {
-      success: false,
-      error: 'تم قفل الحساب مؤقتاً لتكرار المحاولات الخاطئة. يرجى المحاولة بعد ' + rateCheck.remainingMinutes + ' دقيقة.'
-    };
-  }
+  // مسح أي أقفال مؤقتة قديمة في CacheService إن وجدت دون قفل الحساب
+  clearLegacyLoginLockCache(normUser);
 
   return withScriptLock(function() {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -1786,18 +1753,15 @@ function verifyLogin(usernameInput, password, offlineVerifierData) {
     var matches = (normalizeUsername(storedUsername) === normUser) || (storedPhone && storedPhone === rawInput);
 
     if (matches) {
-      var status = String(row[6]).trim();
-      if (status !== 'نشط' && status !== 'active' && status !== 'true') {
-        return { success: false, error: 'هذا الحساب موقوف، يرجى مراجعة مالك النظام' };
-      }
-
       var salt = String(row[4]);
       var storedHash = String(row[5]);
       var computedHash = hashPassword(password, salt);
 
       if (computedHash === storedHash) {
-        // نجاح تسجيل الدخول - مسح عداد المحاولات الفاشلة
-        clearFailedLogins(normUser);
+        var status = String(row[6]).trim();
+        if (status !== 'نشط' && status !== 'active' && status !== 'true') {
+          return { success: false, error: 'هذا الحساب موقوف، يرجى مراجعة مالك النظام' };
+        }
 
         var rawRole = String(row[3]).trim();
         var isOwner = row[9] === true || String(row[9] || '').toLowerCase() === 'true';
@@ -1911,25 +1875,17 @@ function verifyLogin(usernameInput, password, offlineVerifierData) {
           }
         };
       } else {
-        // كلمة مرور خاطئة - تسجيل المحاولة الفاشلة
-        var failResult = recordFailedLogin(normUser);
-        if (failResult.lockedNow) {
-          return {
-            success: false,
-            error: 'تم تجاوز الحد الأقصى للمحاولات الخاطئة (5 محاولات). تم إيقاف الحساب مؤقتًا لمدة 15 دقيقة.'
-          };
-        }
+        // كلمة مرور خاطئة - رسالة موحدة بدون عداد محاولات أو قفل للحساب
         return {
           success: false,
-          error: 'كلمة المرور غير صحيحة. متبقي ' + failResult.triesLeft + ' محاولات قبل الإيقاف المؤقت.'
+          error: 'اسم المستخدم أو كلمة المرور غير صحيحة'
         };
       }
     }
   }
 
-  // اسم المستخدم غير موجود
-  recordFailedLogin(normUser);
-  return { success: false, error: 'اسم المستخدم غير مسجل بالنظام' };
+  // اسم المستخدم غير موجود - نفس الرسالة الموحدة تماماً
+  return { success: false, error: 'اسم المستخدم أو كلمة المرور غير صحيحة' };
   });
 }
 

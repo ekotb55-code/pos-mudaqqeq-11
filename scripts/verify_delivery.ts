@@ -129,17 +129,266 @@ check('أداء أحمد: 4 طلبات، 3 اتسلموا، 1 ما اتسلمش'
 check('الرسوم: 25 + 25 + 15 + 15 = 80', near(rep.fees.total, 80));
 
 // ---- الحفظ وإعادة الضبط ----
-const [cfgCol, opsCol] = D.getDeliveryCollections();
+const [cfgCol, opsCol, prepCol] = D.getDeliveryCollections();
+check('مجموعة طلبات التحضير من نوع list', prepCol?.name === 'delivery.preparations' && prepCol?.kind === 'list');
+
+// ---- المرحلة الثانية: طلبات تحضير التوصيل (كيان مستقل قبل الشحن والفاتورة) ----
+const prepKey = 'prep-key-0001';
+const prepRes1 = D.createPreparationOrder(
+  {
+    idempotencyKey: prepKey,
+    paymentMode: 'cod',
+    address: 'شارع التحرير 10',
+    phone: '01012345678',
+    zoneId: zone.id,
+    notes: 'تجهيز سريع'
+  },
+  {
+    customer: { id: 'c1', name: 'سارة', phone: '01012345678', address: 'شارع التحرير 10', zoneId: zone.id },
+    lines: [
+      { itemId: 'i1', itemName: 'شاحن أصلي', unit: 'قطعة', quantity: 2, unitPrice: 100 },
+      { itemId: 'i2', itemName: 'سماعة', unit: 'قطعة', quantity: 1, unitPrice: 50 }
+    ]
+  },
+  owner
+);
+check(
+  'إنشاء طلب تحضير مستقل PRP-000001 بدون إنشاء طلب توصيل فاتورة',
+  prepRes1.order.number === 'PRP-000001' &&
+    prepRes1.order.status === 'قيد التحضير' &&
+    prepRes1.order.revision === 1 &&
+    near(prepRes1.order.itemsSubtotal, 250) &&
+    near(prepRes1.order.fee, 15) &&
+    near(prepRes1.order.estimatedTotal, 265) &&
+    D.listOrders().length === 5 &&
+    D.listPreparationOrders().length === 1
+);
+
+const prepDup = D.createPreparationOrder(
+  { idempotencyKey: prepKey, paymentMode: 'cod', address: 'شارع مختلف', zoneId: zone.id },
+  {
+    customer: { id: 'c1', name: 'سارة', zoneId: zone.id },
+    lines: [{ itemId: 'i1', itemName: 'شاحن أصلي', unit: 'قطعة', quantity: 5, unitPrice: 100 }]
+  },
+  owner
+);
+check(
+  'عدم التكرار بنفس idempotencyKey يرجع نفس طلب التحضير ولا ينشئ سجلًا مكررًا',
+  prepDup.duplicate === true &&
+    prepDup.order.id === prepRes1.order.id &&
+    prepDup.order.number === 'PRP-000001' &&
+    D.listPreparationOrders().length === 1
+);
+
+const prepUpdated = D.updatePreparationOrder(
+  prepRes1.order.id,
+  {
+    revision: 1,
+    address: 'شارع التحرير 22 - الدور الثالث',
+    notes: 'تم تعديل الكمية والعنوان'
+  },
+  {
+    lines: [{ itemId: 'i1', itemName: 'شاحن أصلي', unit: 'قطعة', quantity: 3, unitPrice: 100 }]
+  },
+  owner
+);
+check(
+  'تعديل الأصناف والكميات وبيانات العميل يزيد رقم المراجعة ويعيد حساب الإجمالي',
+  prepUpdated.revision === 2 &&
+    prepUpdated.address === 'شارع التحرير 22 - الدور الثالث' &&
+    prepUpdated.lines.length === 1 &&
+    prepUpdated.lines[0].quantity === 3 &&
+    near(prepUpdated.itemsSubtotal, 300) &&
+    near(prepUpdated.estimatedTotal, 315)
+);
+
+throws(
+  'رفض التعديل المتعارض عند اختلاف رقم المراجعة (revision قديم)',
+  () =>
+    D.updatePreparationOrder(
+      prepRes1.order.id,
+      { revision: 1, address: 'تعديل متأخر من تبويب آخر' },
+      {},
+      owner
+    ),
+  'REVISION_CONFLICT'
+);
+
+const prepCancelled = D.cancelPreparationOrder(
+  prepRes1.order.id,
+  { reason: 'العميل أجّل الطلب قبل الشحن', revision: 2 },
+  owner
+);
+check(
+  'إلغاء طلب التحضير قبل الشحن يغير الحالة إلى اتلغى ويزيد المراجعة',
+  prepCancelled.status === 'اتلغى' &&
+    prepCancelled.revision === 3 &&
+    prepCancelled.cancelReason === 'العميل أجّل الطلب قبل الشحن' &&
+    Boolean(prepCancelled.cancelledAt)
+);
+throws(
+  'رفض تعديل طلب التحضير بعد إلغائه',
+  () => D.updatePreparationOrder(prepRes1.order.id, { revision: 3, address: 'محاولة تعديل' }, {}, owner),
+  'INVALID_STATUS'
+);
+throws(
+  'رفض إلغاء طلب التحضير الملغي مرة أخرى',
+  () => D.cancelPreparationOrder(prepRes1.order.id, { reason: 'تكرار' }, owner),
+  'ALREADY_CANCELLED'
+);
+
 const cfgCopy = JSON.parse(JSON.stringify(cfgCol.get()));
 const opsCopy = JSON.parse(JSON.stringify(opsCol.get()));
+const prepCopy = JSON.parse(JSON.stringify(prepCol.get()));
 D.resetDeliveryOperations();
-check('إعادة ضبط العمليات: الطلبات اتمسحت والطيارين فضلوا', D.listOrders().length === 0 && D.listDrivers().length === 1);
+check(
+  'إعادة ضبط العمليات: الطلبات وطلبات التحضير اتمسحت والطيارين فضلوا',
+  D.listOrders().length === 0 && D.listPreparationOrders().length === 0 && D.listDrivers().length === 1
+);
 opsCol.set(opsCopy);
 cfgCol.set(cfgCopy);
-check('الاسترجاع من قاعدة البيانات', D.listOrders().length === 5 && D.getDeliverySettings().zonePricing === true);
+prepCol.set(prepCopy);
+check(
+  'الاسترجاع من قاعدة البيانات يشمل طلبات التحضير',
+  D.listOrders().length === 5 &&
+    D.listPreparationOrders().length === 1 &&
+    D.getPreparationOrder(prepRes1.order.id)?.revision === 3 &&
+    D.getDeliverySettings().zonePricing === true
+);
 const o6 = D.createOrderForInvoice({ ...plan }, { invoiceNumber: 'INV-6', total: 1 });
 check('العد بيكمل بعد الاسترجاع', o6.number === 'DLV-000006');
+const prep2 = D.createPreparationOrder(
+  { idempotencyKey: 'prep-key-0002', paymentMode: 'prepaid', address: 'حلوان 5', zoneId: zone.id },
+  {
+    customer: { id: 'c2', name: 'محمود', zoneId: zone.id },
+    lines: [{ itemId: 'i1', itemName: 'شاحن أصلي', unit: 'قطعة', quantity: 2, unitPrice: 100 }]
+  },
+  owner
+);
+check('عد طلبات التحضير يكمل بعد الاسترجاع PRP-000002', prep2.order.number === 'PRP-000002');
+
+// ---- المرحلة الثالثة: انتقالات الشحن والربط والتوافق مع السجلات القديمة ----
+const detKey = D.buildPreparationDispatchIdempotencyKey(prep2.order.id);
+check(
+  'مفتاح الشحن حتمي ومشتق من هوية طلب التحضير',
+  detKey === `delivery-prep-dispatch:${prep2.order.id}`
+);
+throws(
+  'منع بدء شحن طلب تحضير ملغي',
+  () => D.beginPreparationDispatch(prepRes1.order.id),
+  'INVALID_STATUS'
+);
+throws(
+  'منع بدء شحن طلب تحضير برقم مراجعة خاطئ',
+  () => D.beginPreparationDispatch(prep2.order.id, { revision: 99 }),
+  'REVISION_CONFLICT'
+);
+const begun = D.beginPreparationDispatch(prep2.order.id, { revision: 1 });
+check(
+  'بدء الشحن يضع الحالة جاري الشحن ويثبت المفتاح الحتمي دون زيادة المراجعة بعد',
+  !begun.alreadyDispatched &&
+    begun.dispatchIdempotencyKey === detKey &&
+    D.getPreparationOrder(prep2.order.id)?.status === 'جاري الشحن' &&
+    D.getPreparationOrder(prep2.order.id)?.revision === 1
+);
+throws(
+  'منع تعديل طلب التحضير أثناء جاري الشحن',
+  () => D.updatePreparationOrder(prep2.order.id, { revision: 1, address: 'تعديل أثناء الشحن' }, {}, owner),
+  'DISPATCH_IN_PROGRESS'
+);
+throws(
+  'منع إلغاء طلب التحضير أثناء جاري الشحن',
+  () => D.cancelPreparationOrder(prep2.order.id, { reason: 'إلغاء أثناء الشحن' }, owner),
+  'DISPATCH_IN_PROGRESS'
+);
+D.revertPreparationDispatch(prep2.order.id);
+check(
+  'التراجع قبل إصدار الفاتورة يعيد الطلب إلى قيد التحضير وقابلًا للتعديل',
+  D.getPreparationOrder(prep2.order.id)?.status === 'قيد التحضير' &&
+    D.getPreparationOrder(prep2.order.id)?.dispatchIdempotencyKey === ''
+);
+
+// استكمال الشحن والربط
+D.beginPreparationDispatch(prep2.order.id, { revision: 1 });
+const linkedO6 = D.linkOrderToPreparation(o6.id, { id: prep2.order.id, number: prep2.order.number });
+check(
+  'ربط سجل التوصيل بطلب التحضير بدون إنشاء سجل ثانٍ',
+  linkedO6?.preparationId === prep2.order.id &&
+    linkedO6?.preparationNumber === prep2.order.number &&
+    D.listOrders().length === 6
+);
+const completedPrep = D.completePreparationDispatch(
+  prep2.order.id,
+  {
+    invoiceNumber: 'INV-6',
+    deliveryOrderId: o6.id,
+    deliveryOrderNumber: o6.number,
+    dispatchIdempotencyKey: detKey,
+    assigneeType: 'driver',
+    assigneeId: drv.id,
+    assigneeName: drv.name
+  },
+  owner
+);
+check(
+  'اكتمال الشحن يحفظ رقم الفاتورة وسجل التوصيل ويحول الحالة إلى خرج للتوصيل',
+  completedPrep.status === 'خرج للتوصيل' &&
+    completedPrep.invoiceNumber === 'INV-6' &&
+    completedPrep.deliveryOrderId === o6.id &&
+    completedPrep.deliveryOrderNumber === o6.number &&
+    completedPrep.revision === 2 &&
+    Boolean(completedPrep.dispatchedAt)
+);
+throws(
+  'رفض تعديل طلب التحضير بعد الشحن',
+  () => D.updatePreparationOrder(prep2.order.id, { revision: 2, address: 'بعد الشحن' }, {}, owner),
+  'ALREADY_DISPATCHED'
+);
+throws(
+  'رفض إلغاء طلب التحضير بعد الشحن',
+  () => D.cancelPreparationOrder(prep2.order.id, { reason: 'بعد الشحن' }, owner),
+  'ALREADY_DISPATCHED'
+);
+
+// التوافق مع السجلات القديمة (بدون حقول المرحلة الثالثة)
+prepCol.set([
+  {
+    id: 'legacy-prep-1',
+    number: 'PRP-000099',
+    status: 'قيد التحضير',
+    revision: 1,
+    idempotencyKey: 'legacy-key-99',
+    createdAt: '2026-01-01T10:00:00.000Z',
+    createdBy: 'كاشير قديم',
+    customerName: 'عميل قديم',
+    phone: '01000000000',
+    address: 'عنوان قديم',
+    paymentMode: 'cod',
+    fee: 20,
+    lines: [{ itemId: 'i1', itemName: 'شاحن', unit: 'قطعة', quantity: 1, unitPrice: 100, lineTotal: 100 }]
+  }
+]);
+const legacyLoaded = D.getPreparationOrder('legacy-prep-1');
+check(
+  'التوافق مع سجلات طلبات التحضير القديمة بدون الحقول الجديدة',
+  Boolean(legacyLoaded) &&
+    legacyLoaded?.status === 'قيد التحضير' &&
+    legacyLoaded?.invoiceNumber === '' &&
+    legacyLoaded?.deliveryOrderId === '' &&
+    legacyLoaded?.deliveryOrderNumber === '' &&
+    legacyLoaded?.dispatchIdempotencyKey === '' &&
+    near(legacyLoaded?.estimatedTotal || 0, 120)
+);
+
 D.resetDelivery();
-check('إعادة ضبط المصنع', !D.getDeliverySettings().enabled && D.listDrivers().length === 0 && D.listOrders().length === 0);
+check(
+  'إعادة ضبط المصنع تمسح طلبات التحضير أيضًا',
+  !D.getDeliverySettings().enabled &&
+    D.listDrivers().length === 0 &&
+    D.listOrders().length === 0 &&
+    D.listPreparationOrders().length === 0
+);
 
 console.log(`\n🎉 كل اختبارات قواعد التوصيل نجحت (${passed} تحققًا).`);
+
+

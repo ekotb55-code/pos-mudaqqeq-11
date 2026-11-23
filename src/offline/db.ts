@@ -469,6 +469,32 @@ export async function requestPersistentStorageOnFirstEntry(): Promise<boolean> {
 // إدارة مخزن outbox بمعاملات durability: 'strict'
 // ============================================================================
 
+export const DELIVERY_PREP_OFFLINE_REJECT_MESSAGE =
+  'لا يمكن إنشاء أو تعديل طلب تحضير التوصيل بدون اتصال بالإنترنت (العملية تتطلب اتصالاً مباشراً بالخادم ولا تُحفظ في طابور الأوفلاين)';
+
+export function assertNotDeliveryPreparationOutboxOperation(input?: {
+  type?: unknown;
+  operationType?: unknown;
+  payload?: unknown;
+}): void {
+  const t = String(input?.type ?? '').trim().toLowerCase();
+  const opType = String(input?.operationType ?? '').trim().toLowerCase();
+  const payload = input?.payload && typeof input.payload === 'object' ? (input.payload as Record<string, unknown>) : null;
+  if (
+    t.includes('deliveryprep') ||
+    t.includes('delivery_prep') ||
+    t.includes('delivery-prep') ||
+    opType.includes('deliveryprep') ||
+    opType.includes('delivery_prep') ||
+    opType.includes('delivery-prep') ||
+    Boolean(payload?.isDeliveryPreparation)
+  ) {
+    const err = new Error(DELIVERY_PREP_OFFLINE_REJECT_MESSAGE) as Error & { code?: string };
+    err.code = 'DELIVERY_PREP_OFFLINE_FORBIDDEN';
+    throw err;
+  }
+}
+
 export async function enqueueOutboxOperation(
   input: Omit<OutboxOperation, 'id' | 'status' | 'retryCount' | 'deviceId' | 'deviceName' | 'createdAt' | 'updatedAt'> & {
     id?: string;
@@ -476,6 +502,7 @@ export async function enqueueOutboxOperation(
     retryCount?: number;
   }
 ): Promise<OutboxOperation> {
+  assertNotDeliveryPreparationOutboxOperation(input);
   await assertOfflineWriteOwnership();
   const identity = await ensureDeviceIdentity();
   const now = new Date().toISOString();
@@ -1043,11 +1070,10 @@ export async function authenticateOfflineUser(
     return { success: false, error: 'اسم المستخدم أو كلمة المرور غير صحيحة' };
   }
 
-  if (matchedUser.status === 'inactive' || matchedUser.status === 'موقوف') {
-    return { success: false, error: 'هذا الحساب موقوف، راجع مالك النظام' };
-  }
-
   if (!matchedUser.offlineVerifier || !matchedUser.offlineSalt) {
+    if (matchedUser.status === 'inactive' || matchedUser.status === 'موقوف') {
+      return { success: false, error: 'اسم المستخدم أو كلمة المرور غير صحيحة' };
+    }
     return { success: false, error: 'سجّل الدخول مرة واحدة مع وجود الإنترنت أولًا' };
   }
 
@@ -1060,6 +1086,10 @@ export async function authenticateOfflineUser(
   if (!constantTimeEqualHex(computedVerifier, matchedUser.offlineVerifier)) {
     // لا قفل بعد المحاولات الفاشلة أوفلاين
     return { success: false, error: 'اسم المستخدم أو كلمة المرور غير صحيحة' };
+  }
+
+  if (matchedUser.status === 'inactive' || matchedUser.status === 'موقوف') {
+    return { success: false, error: 'هذا الحساب موقوف، راجع مالك النظام' };
   }
 
   const sessionUser: UserAccount = { ...matchedUser };

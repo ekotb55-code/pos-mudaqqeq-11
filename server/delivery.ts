@@ -156,6 +156,64 @@ export interface DeliveryOrder {
   payoutId: string;
   /** المرتجع الرسمي لما الطلب يرجع أو يتلغي */
   returnNumber: string;
+  /** معرّف طلب تحضير التوصيل المرتبط (إن وجد) */
+  preparationId?: string;
+  /** رقم طلب تحضير التوصيل المرتبط (PRP-...) */
+  preparationNumber?: string;
+}
+
+export type DeliveryPreparationStatus = 'قيد التحضير' | 'جاري الشحن' | 'خرج للتوصيل' | 'اتلغى';
+
+export interface DeliveryPreparationLine {
+  itemId: string;
+  itemName: string;
+  unit: string;
+  quantity: number;
+  unitPrice: number;
+  lineTotal: number;
+}
+
+export interface DeliveryPreparationOrder {
+  id: string;
+  number: string;
+  status: DeliveryPreparationStatus;
+  revision: number;
+  idempotencyKey: string;
+  createdAt: string;
+  createdBy: string;
+  createdById: string;
+  updatedAt: string;
+  updatedBy: string;
+  updatedById: string;
+  cancelledAt: string;
+  cancelledBy: string;
+  cancelledById: string;
+  cancelReason: string;
+  customerId: string;
+  customerName: string;
+  phone: string;
+  address: string;
+  zoneId: string;
+  zoneName: string;
+  zoneCommission: number;
+  fee: number;
+  feeManual: boolean;
+  paymentMode: PaymentMode;
+  assigneeType: AssigneeType | '';
+  assigneeId: string;
+  assigneeName: string;
+  trackingNumber: string;
+  notes: string;
+  lines: DeliveryPreparationLine[];
+  itemsSubtotal: number;
+  estimatedTotal: number;
+  invoiceNumber: string;
+  deliveryOrderId: string;
+  deliveryOrderNumber: string;
+  dispatchedAt: string;
+  dispatchedBy: string;
+  dispatchedById: string;
+  dispatchIdempotencyKey: string;
 }
 
 export interface DeliverySettlement {
@@ -271,17 +329,24 @@ interface OperationsState {
   orders: DeliveryOrder[];
   settlements: DeliverySettlement[];
   payouts: DriverPayout[];
-  /** آخر رقم طلب / تسوية / صرف */
-  counters: { order: number; settlement: number; payout: number };
-  /** مفاتيح عدم التكرار للتسوية والصرف: المفتاح ← رقم المستند */
+  /** آخر رقم طلب / تسوية / صرف / تحضير */
+  counters: { order: number; settlement: number; payout: number; preparation: number };
+  /** مفاتيح عدم التكرار للتسوية والصرف والتحضير: المفتاح ← رقم المستند */
   doneKeys: Record<string, string>;
 }
 
 let config: ConfigState = { settings: defaultDeliverySettings(), zones: [], drivers: [], couriers: [] };
 let ops: OperationsState = emptyOps();
+let preparations: DeliveryPreparationOrder[] = [];
 
 function emptyOps(): OperationsState {
-  return { orders: [], settlements: [], payouts: [], counters: { order: 0, settlement: 0, payout: 0 }, doneKeys: {} };
+  return {
+    orders: [],
+    settlements: [],
+    payouts: [],
+    counters: { order: 0, settlement: 0, payout: 0, preparation: 0 },
+    doneKeys: {}
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -532,6 +597,8 @@ export interface DeliveryPlan {
   address: string;
   assignee: { type: AssigneeType; id: string; name: string } | null;
   trackingNumber: string;
+  preparationId?: string;
+  preparationNumber?: string;
 }
 
 export interface PrepareContext {
@@ -579,7 +646,7 @@ export function prepareDeliveryPlan(input: any, ctx: PrepareContext): DeliveryPl
   if (src.fee !== undefined && src.fee !== null && String(src.fee).trim() !== '') {
     const requested = money(src.fee, 'رسوم التوصيل');
     if (Math.abs(requested - computed) >= 0.01) {
-      if (!hasDeliveryPermission(ctx.actor, 'delivery.edit_fee')) {
+      if (!src.preserveManualFee && !hasDeliveryPermission(ctx.actor, 'delivery.edit_fee')) {
         throw new DeliveryError('مش مسموحلك تعدّل رسوم التوصيل على الفاتورة', 'DELIVERY_FEE_FORBIDDEN', 403);
       }
       fee = requested;
@@ -589,6 +656,9 @@ export function prepareDeliveryPlan(input: any, ctx: PrepareContext): DeliveryPl
 
   let assignee: DeliveryPlan['assignee'] = null;
   if (src.assigneeType || src.assigneeId) assignee = resolveAssignee(src.assigneeType, src.assigneeId);
+
+  const preparationId = text(src.preparationId, 100);
+  const preparationNumber = text(src.preparationNumber, 60);
 
   return {
     paymentMode,
@@ -603,7 +673,9 @@ export function prepareDeliveryPlan(input: any, ctx: PrepareContext): DeliveryPl
     phone,
     address,
     assignee,
-    trackingNumber: assignee?.type === 'courier' ? text(src.trackingNumber, 60) : ''
+    trackingNumber: assignee?.type === 'courier' ? text(src.trackingNumber, 60) : '',
+    ...(preparationId ? { preparationId } : {}),
+    ...(preparationNumber ? { preparationNumber } : {})
   };
 }
 
@@ -617,13 +689,15 @@ export function checkPlanTotals(plan: DeliveryPlan, itemsTotal: number): void {
 /** بيتنادي بعد حفظ الفاتورة: يسجل طلب التوصيل */
 export function createOrderForInvoice(
   plan: DeliveryPlan,
-  invoice: { invoiceNumber: string; total: number },
+  invoice: { invoiceNumber: string; total: number; preparationId?: string; preparationNumber?: string },
   actor?: DeliveryActor,
   now: Date = new Date()
 ): DeliveryOrder {
   ops.counters.order += 1;
   const at = now.toISOString();
   const by = actorName(actor);
+  const preparationId = text(invoice.preparationId || plan.preparationId, 100);
+  const preparationNumber = text(invoice.preparationNumber || plan.preparationNumber, 60);
   const order: DeliveryOrder = {
     id: newId('dlv'),
     number: `DLV-${pad(ops.counters.order)}`,
@@ -656,10 +730,26 @@ export function createOrderForInvoice(
     courierFee: 0,
     settlementId: '',
     payoutId: '',
-    returnNumber: ''
+    returnNumber: '',
+    ...(preparationId ? { preparationId } : {}),
+    ...(preparationNumber ? { preparationNumber } : {})
   };
   ops.orders.unshift(order);
   return { ...order };
+}
+
+/** ربط طلب التوصيل بطلب التحضير المرتبط به بشكل حتمي دون إنشاء سجل توصيل ثانٍ */
+export function linkOrderToPreparation(
+  orderIdOrInvoiceNumber: string,
+  prep: { id: string; number: string }
+): DeliveryOrder | undefined {
+  const key = String(orderIdOrInvoiceNumber || '').trim();
+  if (!key) return undefined;
+  const o = ops.orders.find(x => x.id === key || x.number === key || x.invoiceNumber === key);
+  if (!o) return undefined;
+  o.preparationId = text(prep.id, 100);
+  o.preparationNumber = text(prep.number, 60);
+  return getOrder(o.id);
 }
 
 // ---------------------------------------------------------------------------
@@ -682,12 +772,107 @@ function normalizeOps(v: any): OperationsState {
     orders: Array.isArray(src.orders) ? src.orders : [],
     settlements: Array.isArray(src.settlements) ? src.settlements : [],
     payouts: Array.isArray(src.payouts) ? src.payouts : [],
-    counters: { order: Number(c.order) || 0, settlement: Number(c.settlement) || 0, payout: Number(c.payout) || 0 },
+    counters: {
+      order: Number(c.order) || 0,
+      settlement: Number(c.settlement) || 0,
+      payout: Number(c.payout) || 0,
+      preparation: Number(c.preparation) || 0
+    },
     doneKeys: src.doneKeys && typeof src.doneKeys === 'object' ? src.doneKeys : {}
   };
 }
 
-/** الإعدادات والمناطق والطيارين والشركات (بتفضل في إعادة ضبط العمليات) + الطلبات والتسويات (بتتمسح) */
+function normalizePreparationLine(raw: any): DeliveryPreparationLine | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const itemId = text(raw.itemId, 100);
+  if (!itemId) return null;
+  const quantity = Math.round((Number(raw.quantity) || 0) * 1000) / 1000;
+  if (!(quantity > 0)) return null;
+  const unitPrice = r2(Number(raw.unitPrice) || 0);
+  const lineTotal = r2(Number(raw.lineTotal) ?? quantity * unitPrice);
+  return {
+    itemId,
+    itemName: text(raw.itemName || itemId, MAX_NAME),
+    unit: text(raw.unit || 'قطعة', 40),
+    quantity,
+    unitPrice,
+    lineTotal
+  };
+}
+
+function normalizePreparationOrder(raw: any): DeliveryPreparationOrder | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = text(raw.id, 100);
+  const number = text(raw.number, 60);
+  if (!id || !number) return null;
+  const lines = Array.isArray(raw.lines)
+    ? (raw.lines.map(normalizePreparationLine).filter(Boolean) as DeliveryPreparationLine[])
+    : [];
+  const itemsSubtotal = r2(
+    Number.isFinite(Number(raw.itemsSubtotal))
+      ? Number(raw.itemsSubtotal)
+      : lines.reduce((s, l) => s + l.lineTotal, 0)
+  );
+  const fee = r2(Number(raw.fee) || 0);
+  const status: DeliveryPreparationStatus =
+    raw.status === 'اتلغى'
+      ? 'اتلغى'
+      : raw.status === 'خرج للتوصيل'
+        ? 'خرج للتوصيل'
+        : raw.status === 'جاري الشحن'
+          ? 'جاري الشحن'
+          : 'قيد التحضير';
+  const revision = Math.max(1, Math.floor(Number(raw.revision) || 1));
+  return {
+    id,
+    number,
+    status,
+    revision,
+    idempotencyKey: text(raw.idempotencyKey, 120),
+    createdAt: String(raw.createdAt || ''),
+    createdBy: text(raw.createdBy, MAX_NAME),
+    createdById: text(raw.createdById, 100),
+    updatedAt: String(raw.updatedAt || raw.createdAt || ''),
+    updatedBy: text(raw.updatedBy || raw.createdBy, MAX_NAME),
+    updatedById: text(raw.updatedById || raw.createdById, 100),
+    cancelledAt: String(raw.cancelledAt || ''),
+    cancelledBy: text(raw.cancelledBy, MAX_NAME),
+    cancelledById: text(raw.cancelledById, 100),
+    cancelReason: text(raw.cancelReason, MAX_TEXT),
+    customerId: text(raw.customerId, 100),
+    customerName: text(raw.customerName, MAX_NAME),
+    phone: text(raw.phone, 30),
+    address: text(raw.address, MAX_TEXT),
+    zoneId: text(raw.zoneId, 100),
+    zoneName: text(raw.zoneName, MAX_NAME),
+    zoneCommission: r2(Number(raw.zoneCommission) || 0),
+    fee,
+    feeManual: Boolean(raw.feeManual),
+    paymentMode: raw.paymentMode === 'prepaid' ? 'prepaid' : 'cod',
+    assigneeType: raw.assigneeType === 'driver' || raw.assigneeType === 'courier' ? raw.assigneeType : '',
+    assigneeId: text(raw.assigneeId, 100),
+    assigneeName: text(raw.assigneeName, MAX_NAME),
+    trackingNumber: text(raw.trackingNumber, 60),
+    notes: text(raw.notes, MAX_TEXT),
+    lines,
+    itemsSubtotal,
+    estimatedTotal: r2(itemsSubtotal + fee),
+    invoiceNumber: text(raw.invoiceNumber, 80),
+    deliveryOrderId: text(raw.deliveryOrderId, 100),
+    deliveryOrderNumber: text(raw.deliveryOrderNumber, 60),
+    dispatchedAt: String(raw.dispatchedAt || ''),
+    dispatchedBy: text(raw.dispatchedBy, MAX_NAME),
+    dispatchedById: text(raw.dispatchedById, 100),
+    dispatchIdempotencyKey: text(raw.dispatchIdempotencyKey, 120)
+  };
+}
+
+function normalizePreparations(v: any): DeliveryPreparationOrder[] {
+  if (!Array.isArray(v)) return [];
+  return v.map(normalizePreparationOrder).filter(Boolean) as DeliveryPreparationOrder[];
+}
+
+/** الإعدادات والمناطق والطيارين والشركات (بتفضل في إعادة ضبط العمليات) + الطلبات والتسويات وطلبات التحضير (بتتمسح) */
 export function getDeliveryCollections(): CollectionDef[] {
   return [
     {
@@ -705,19 +890,545 @@ export function getDeliveryCollections(): CollectionDef[] {
       set: value => {
         ops = normalizeOps(value);
       }
+    },
+    {
+      name: 'delivery.preparations',
+      kind: 'list',
+      idOf: (doc: any) => doc?.id,
+      get: () => preparations,
+      set: value => {
+        preparations = normalizePreparations(value);
+      }
     }
   ];
 }
 
-/** مع «إعادة ضبط العمليات»: الطلبات والتسويات والصرف تتمسح، والإعدادات والأسماء تفضل */
+/** مع «إعادة ضبط العمليات»: الطلبات والتسويات والصرف وطلبات التحضير تتمسح، والإعدادات والأسماء تفضل */
 export function resetDeliveryOperations(): void {
   ops = emptyOps();
+  preparations = [];
 }
 
 /** مع «إعادة ضبط المصنع» */
 export function resetDelivery(): void {
   config = { settings: defaultDeliverySettings(), zones: [], drivers: [], couriers: [] };
   ops = emptyOps();
+  preparations = [];
+}
+
+// ---------------------------------------------------------------------------
+// طلبات تحضير التوصيل (المرحلة الثانية — كيان تحضير مستقل قبل الشحن والفاتورة)
+// ---------------------------------------------------------------------------
+
+export interface ResolvedPreparationLine {
+  itemId: string;
+  itemName: string;
+  unit: string;
+  quantity: number;
+  unitPrice: number;
+}
+
+export interface ResolvedPreparationContext {
+  customer?: { id: string; name: string; phone?: string; address?: string; city?: string; zoneId?: string } | null;
+  lines?: ResolvedPreparationLine[];
+}
+
+function clonePreparationOrder(p: DeliveryPreparationOrder): DeliveryPreparationOrder {
+  return {
+    ...p,
+    lines: p.lines.map(l => ({ ...l }))
+  };
+}
+
+function nextPreparationNumber(): string {
+  let maxSeen = Number(ops.counters.preparation) || 0;
+  for (const p of preparations) {
+    const m = /^PRP-(\d+)$/.exec(p.number);
+    if (m) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > maxSeen) maxSeen = n;
+    }
+  }
+  ops.counters.preparation = maxSeen + 1;
+  return `PRP-${pad(ops.counters.preparation)}`;
+}
+
+export function preparationByKey(key: string): DeliveryPreparationOrder | undefined {
+  const cleanKey = text(key, 120);
+  if (!cleanKey) return undefined;
+  const num = ops.doneKeys[`prep:${cleanKey}`];
+  const found = preparations.find(p => p.idempotencyKey === cleanKey || (num && p.number === num));
+  return found ? clonePreparationOrder(found) : undefined;
+}
+
+export function listPreparationOrders(
+  filter: { status?: string; customerId?: string; zoneId?: string; from?: string; to?: string; open?: boolean } = {}
+): DeliveryPreparationOrder[] {
+  return preparations
+    .filter(p => !filter.status || p.status === filter.status)
+    .filter(p => !filter.customerId || p.customerId === filter.customerId)
+    .filter(p => !filter.zoneId || p.zoneId === filter.zoneId)
+    .filter(p => !filter.open || p.status === 'قيد التحضير')
+    .filter(p => !filter.from || p.createdAt.slice(0, 10) >= filter.from)
+    .filter(p => !filter.to || p.createdAt.slice(0, 10) <= filter.to)
+    .map(clonePreparationOrder);
+}
+
+export function getPreparationOrder(idOrNumber: string): DeliveryPreparationOrder | undefined {
+  const key = String(idOrNumber || '').trim();
+  if (!key) return undefined;
+  const found = preparations.find(p => p.id === key || p.number === key);
+  return found ? clonePreparationOrder(found) : undefined;
+}
+
+function buildPreparationLines(resolvedLines: ResolvedPreparationLine[] | undefined): {
+  lines: DeliveryPreparationLine[];
+  itemsSubtotal: number;
+} {
+  if (!Array.isArray(resolvedLines) || resolvedLines.length === 0) {
+    throw new DeliveryError('أضف صنفًا واحدًا على الأقل في طلب التحضير');
+  }
+  if (resolvedLines.length > 200) {
+    throw new DeliveryError('عدد بنود طلب التحضير لا يتجاوز 200 بند');
+  }
+  const lines: DeliveryPreparationLine[] = resolvedLines.map((raw, idx) => {
+    const itemId = text(raw?.itemId, 100);
+    if (!itemId) throw new DeliveryError(`البند رقم ${idx + 1}: الصنف مطلوب`);
+    const q = Number(raw?.quantity);
+    if (!Number.isFinite(q) || q <= 0 || q > 1_000_000) {
+      throw new DeliveryError(`البند رقم ${idx + 1}: الكمية لازم تكون رقم أكبر من صفر`);
+    }
+    const quantity = Math.round(q * 1000) / 1000;
+    const unitPrice = money(raw?.unitPrice, `سعر الصنف في البند رقم ${idx + 1}`, 0);
+    const lineTotal = r2(quantity * unitPrice);
+    return {
+      itemId,
+      itemName: text(raw?.itemName || itemId, MAX_NAME),
+      unit: text(raw?.unit || 'قطعة', 40),
+      quantity,
+      unitPrice,
+      lineTotal
+    };
+  });
+  const itemsSubtotal = r2(lines.reduce((s, l) => s + l.lineTotal, 0));
+  return { lines, itemsSubtotal };
+}
+
+export function createPreparationOrder(
+  input: any,
+  resolved: ResolvedPreparationContext,
+  actor?: DeliveryActor,
+  now: Date = new Date()
+): { order: DeliveryPreparationOrder; duplicate?: boolean } {
+  const src = input && typeof input === 'object' ? input : {};
+  const rawKey = typeof src.idempotencyKey === 'string' ? src.idempotencyKey.trim() : '';
+  if (rawKey.length < 8 || rawKey.length > 120) {
+    throw new DeliveryError('مفتاح العملية ناقص (idempotencyKey)');
+  }
+  const existing = preparationByKey(rawKey);
+  if (existing) {
+    return { order: existing, duplicate: true };
+  }
+
+  const plan = prepareDeliveryPlan(src, {
+    isDirectSale: true,
+    actor,
+    customer: resolved.customer || null,
+    customerName: src.customerName
+  });
+  if (!plan.customerName) {
+    throw new DeliveryError('اكتب اسم العميل أو اختار عميل مسجل');
+  }
+
+  const { lines, itemsSubtotal } = buildPreparationLines(resolved.lines);
+  checkPlanTotals(plan, itemsSubtotal);
+
+  const at = now.toISOString();
+  const by = actorName(actor);
+  const byId = String(actor?.userId || '');
+  const number = nextPreparationNumber();
+
+  const order: DeliveryPreparationOrder = {
+    id: newId('prp'),
+    number,
+    status: 'قيد التحضير',
+    revision: 1,
+    idempotencyKey: rawKey,
+    createdAt: at,
+    createdBy: by,
+    createdById: byId,
+    updatedAt: at,
+    updatedBy: by,
+    updatedById: byId,
+    cancelledAt: '',
+    cancelledBy: '',
+    cancelledById: '',
+    cancelReason: '',
+    customerId: plan.customerId,
+    customerName: plan.customerName,
+    phone: plan.phone,
+    address: plan.address,
+    zoneId: plan.zoneId,
+    zoneName: plan.zoneName,
+    zoneCommission: plan.zoneCommission,
+    fee: plan.fee,
+    feeManual: plan.feeManual,
+    paymentMode: plan.paymentMode,
+    assigneeType: plan.assignee?.type || '',
+    assigneeId: plan.assignee?.id || '',
+    assigneeName: plan.assignee?.name || '',
+    trackingNumber: plan.trackingNumber,
+    notes: text(src.notes, MAX_TEXT),
+    lines,
+    itemsSubtotal,
+    estimatedTotal: r2(itemsSubtotal + plan.fee),
+    invoiceNumber: '',
+    deliveryOrderId: '',
+    deliveryOrderNumber: '',
+    dispatchedAt: '',
+    dispatchedBy: '',
+    dispatchedById: '',
+    dispatchIdempotencyKey: ''
+  };
+
+  ops.doneKeys[`prep:${rawKey}`] = order.number;
+  preparations.unshift(order);
+  return { order: clonePreparationOrder(order) };
+}
+
+export function updatePreparationOrder(
+  idOrNumber: string,
+  input: any,
+  resolved: ResolvedPreparationContext,
+  actor?: DeliveryActor,
+  now: Date = new Date()
+): DeliveryPreparationOrder {
+  const key = String(idOrNumber || '').trim();
+  const existing = preparations.find(p => p.id === key || p.number === key);
+  if (!existing) throw new DeliveryError('طلب التحضير مش موجود', 'NOT_FOUND', 404);
+  if (existing.status === 'خرج للتوصيل' || Boolean(existing.invoiceNumber)) {
+    throw new DeliveryError('لا يمكن تعديل طلب التحضير بعد إرساله للشحن وإصدار الفاتورة', 'ALREADY_DISPATCHED', 409);
+  }
+  if (existing.status === 'جاري الشحن') {
+    throw new DeliveryError('طلب التحضير جاري إرساله للشحن؛ أعد محاولة الشحن لاستكمال ربط الفاتورة ولا يمكن تعديله الآن', 'DISPATCH_IN_PROGRESS', 409);
+  }
+  if (existing.status !== 'قيد التحضير') {
+    throw new DeliveryError('لا يمكن تعديل طلب تحضير ملغي أو غير قابل للتعديل', 'INVALID_STATUS', 409);
+  }
+
+  const src = input && typeof input === 'object' ? input : {};
+  const expectedRevision = Number(src.revision ?? src.expectedRevision);
+  if (!Number.isInteger(expectedRevision) || expectedRevision < 1) {
+    throw new DeliveryError('رقم مراجعة طلب التحضير (revision) مطلوب للتعديل', 'REVISION_REQUIRED', 400);
+  }
+  if (expectedRevision !== existing.revision) {
+    throw new DeliveryError(
+      'تم تعديل طلب التحضير من مستخدم أو تبويب آخر؛ يرجى تحديث البيانات والمحاولة مرة أخرى',
+      'REVISION_CONFLICT',
+      409
+    );
+  }
+
+  const clearAssignee =
+    (src.assigneeType !== undefined && String(src.assigneeType).trim() === '') ||
+    (src.assigneeId !== undefined && String(src.assigneeId).trim() === '');
+
+  const mergedPlanInput = {
+    paymentMode: src.paymentMode !== undefined ? src.paymentMode : existing.paymentMode,
+    address: src.address !== undefined ? src.address : existing.address,
+    phone: src.phone !== undefined ? src.phone : existing.phone,
+    zoneId: src.zoneId !== undefined ? src.zoneId : existing.zoneId,
+    fee: src.fee !== undefined ? src.fee : undefined,
+    assigneeType: clearAssignee ? '' : src.assigneeType !== undefined ? src.assigneeType : existing.assigneeType,
+    assigneeId: clearAssignee ? '' : src.assigneeId !== undefined ? src.assigneeId : existing.assigneeId,
+    trackingNumber: src.trackingNumber !== undefined ? src.trackingNumber : existing.trackingNumber
+  };
+
+  const cust =
+    resolved.customer !== undefined
+      ? resolved.customer
+      : existing.customerId
+        ? {
+            id: existing.customerId,
+            name: existing.customerName,
+            phone: existing.phone,
+            address: existing.address,
+            zoneId: existing.zoneId
+          }
+        : null;
+
+  const plan = prepareDeliveryPlan(mergedPlanInput, {
+    isDirectSale: true,
+    actor,
+    customer: cust,
+    customerName: src.customerName !== undefined ? src.customerName : existing.customerName
+  });
+  if (!plan.customerName) {
+    throw new DeliveryError('اكتب اسم العميل أو اختار عميل مسجل');
+  }
+
+  // إذا لم يُرسل حقل الرسوم في التعديل ولم تتغير المنطقة وكان الطلب يحمل رسومًا يدوية محفوظة سابقًا، نحتفظ بها
+  if (
+    src.fee === undefined &&
+    existing.feeManual &&
+    plan.zoneId === existing.zoneId
+  ) {
+    plan.fee = existing.fee;
+    plan.feeManual = true;
+  }
+
+  const nextLinesResult =
+    resolved.lines !== undefined
+      ? buildPreparationLines(resolved.lines)
+      : { lines: existing.lines.map(l => ({ ...l })), itemsSubtotal: existing.itemsSubtotal };
+
+  checkPlanTotals(plan, nextLinesResult.itemsSubtotal);
+
+  const at = now.toISOString();
+  const by = actorName(actor);
+  const byId = String(actor?.userId || '');
+
+  existing.revision += 1;
+  existing.updatedAt = at;
+  existing.updatedBy = by;
+  existing.updatedById = byId;
+  existing.customerId = plan.customerId;
+  existing.customerName = plan.customerName;
+  existing.phone = plan.phone;
+  existing.address = plan.address;
+  existing.zoneId = plan.zoneId;
+  existing.zoneName = plan.zoneName;
+  existing.zoneCommission = plan.zoneCommission;
+  existing.fee = plan.fee;
+  existing.feeManual = plan.feeManual;
+  existing.paymentMode = plan.paymentMode;
+  existing.assigneeType = plan.assignee?.type || '';
+  existing.assigneeId = plan.assignee?.id || '';
+  existing.assigneeName = plan.assignee?.name || '';
+  existing.trackingNumber = plan.trackingNumber;
+  if (src.notes !== undefined) {
+    existing.notes = text(src.notes, MAX_TEXT);
+  }
+  existing.lines = nextLinesResult.lines;
+  existing.itemsSubtotal = nextLinesResult.itemsSubtotal;
+  existing.estimatedTotal = r2(nextLinesResult.itemsSubtotal + plan.fee);
+
+  return clonePreparationOrder(existing);
+}
+
+export function cancelPreparationOrder(
+  idOrNumber: string,
+  input: { reason?: unknown; revision?: unknown } = {},
+  actor?: DeliveryActor,
+  now: Date = new Date()
+): DeliveryPreparationOrder {
+  const key = String(idOrNumber || '').trim();
+  const existing = preparations.find(p => p.id === key || p.number === key);
+  if (!existing) throw new DeliveryError('طلب التحضير مش موجود', 'NOT_FOUND', 404);
+  if (existing.status === 'اتلغى') {
+    throw new DeliveryError('طلب التحضير ملغي بالفعل', 'ALREADY_CANCELLED', 409);
+  }
+  if (existing.status === 'خرج للتوصيل' || Boolean(existing.invoiceNumber)) {
+    throw new DeliveryError('لا يمكن إلغاء طلب التحضير بعد إرساله للشحن وإصدار الفاتورة', 'ALREADY_DISPATCHED', 409);
+  }
+  if (existing.status === 'جاري الشحن') {
+    throw new DeliveryError('طلب التحضير جاري إرساله للشحن؛ أعد محاولة الشحن لاستكمال ربط الفاتورة ولا يمكن إلغاؤه الآن', 'DISPATCH_IN_PROGRESS', 409);
+  }
+  if (existing.status !== 'قيد التحضير') {
+    throw new DeliveryError('لا يمكن إلغاء طلب التحضير في حالته الحالية', 'INVALID_STATUS', 409);
+  }
+
+  if (input?.revision !== undefined && input?.revision !== null && String(input.revision).trim() !== '') {
+    const expectedRevision = Number(input.revision);
+    if (!Number.isInteger(expectedRevision) || expectedRevision !== existing.revision) {
+      throw new DeliveryError(
+        'تم تعديل طلب التحضير من مستخدم أو تبويب آخر؛ يرجى تحديث البيانات والمحاولة مرة أخرى',
+        'REVISION_CONFLICT',
+        409
+      );
+    }
+  }
+
+  const at = now.toISOString();
+  const by = actorName(actor);
+  const byId = String(actor?.userId || '');
+
+  existing.status = 'اتلغى';
+  existing.revision += 1;
+  existing.cancelledAt = at;
+  existing.cancelledBy = by;
+  existing.cancelledById = byId;
+  existing.cancelReason = text(input?.reason || '', MAX_TEXT);
+  existing.updatedAt = at;
+  existing.updatedBy = by;
+  existing.updatedById = byId;
+
+  return clonePreparationOrder(existing);
+}
+
+/** توليد مفتاح عدم تكرار حتمي مشتق من هوية طلب التحضير نفسه */
+export function buildPreparationDispatchIdempotencyKey(prepId: string): string {
+  const cleanId = text(prepId, 100);
+  if (!cleanId) throw new DeliveryError('معرّف طلب التحضير غير صالح', 'INVALID_PREPARATION_ID', 400);
+  return `delivery-prep-dispatch:${cleanId}`;
+}
+
+/**
+ * بدء عملية شحن طلب التحضير:
+ * - يتحقق من وجود الطلب وعدم إلغائه ومطابقة رقم المراجعة (revision).
+ * - إذا كان الطلب قد شُحن بالفعل (`خرج للتوصيل` مع `invoiceNumber`)، يعيد `alreadyDispatched: true`.
+ * - إذا كان `قيد التحضير` أو `جاري الشحن` (إعادة محاولة بعد انقطاع)، يثبت مفتاح الشحن الحتمي ويضع الحالة `جاري الشحن`.
+ */
+export function beginPreparationDispatch(
+  idOrNumber: string,
+  input: { revision?: unknown } = {}
+): {
+  order: DeliveryPreparationOrder;
+  alreadyDispatched: boolean;
+  dispatchIdempotencyKey: string;
+} {
+  const key = String(idOrNumber || '').trim();
+  const existing = preparations.find(p => p.id === key || p.number === key);
+  if (!existing) throw new DeliveryError('طلب التحضير مش موجود', 'NOT_FOUND', 404);
+  if (existing.status === 'اتلغى') {
+    throw new DeliveryError('لا يمكن إرسال طلب تحضير ملغي للشحن', 'INVALID_STATUS', 409);
+  }
+
+  const dispatchIdempotencyKey =
+    existing.dispatchIdempotencyKey || buildPreparationDispatchIdempotencyKey(existing.id);
+
+  const hasRevisionInput =
+    input?.revision !== undefined && input?.revision !== null && String(input.revision).trim() !== '';
+
+  if (existing.status === 'خرج للتوصيل' && existing.invoiceNumber) {
+    if (hasRevisionInput) {
+      const expectedRevision = Number(input.revision);
+      // نسمح برقم المراجعة الحالي أو الرقم الذي أُرسل به طلب الشحن الأصلي (existing.revision - 1) لدعم إعادة المحاولة بنفس الطلب
+      if (
+        !Number.isInteger(expectedRevision) ||
+        (expectedRevision !== existing.revision && expectedRevision !== existing.revision - 1)
+      ) {
+        throw new DeliveryError(
+          'تم تعديل طلب التحضير من مستخدم أو تبويب آخر؛ يرجى تحديث البيانات والمحاولة مرة أخرى',
+          'REVISION_CONFLICT',
+          409
+        );
+      }
+    }
+    return {
+      order: clonePreparationOrder(existing),
+      alreadyDispatched: true,
+      dispatchIdempotencyKey
+    };
+  }
+
+  if (hasRevisionInput) {
+    const expectedRevision = Number(input.revision);
+    if (!Number.isInteger(expectedRevision) || expectedRevision !== existing.revision) {
+      throw new DeliveryError(
+        'تم تعديل طلب التحضير من مستخدم أو تبويب آخر؛ يرجى تحديث البيانات والمحاولة مرة أخرى',
+        'REVISION_CONFLICT',
+        409
+      );
+    }
+  }
+
+  existing.status = 'جاري الشحن';
+  existing.dispatchIdempotencyKey = dispatchIdempotencyKey;
+
+  return {
+    order: clonePreparationOrder(existing),
+    alreadyDispatched: false,
+    dispatchIdempotencyKey
+  };
+}
+
+/** التراجع عن حالة `جاري الشحن` إلى `قيد التحضير` عندما يفشل التحقق قبل إنشاء أي فاتورة */
+export function revertPreparationDispatch(idOrNumber: string): DeliveryPreparationOrder | undefined {
+  const key = String(idOrNumber || '').trim();
+  const existing = preparations.find(p => p.id === key || p.number === key);
+  if (!existing) return undefined;
+  if (existing.status === 'جاري الشحن' && !existing.invoiceNumber) {
+    existing.status = 'قيد التحضير';
+    existing.dispatchIdempotencyKey = '';
+  }
+  return clonePreparationOrder(existing);
+}
+
+/** استكمال ربط طلب التحضير بالفاتورة الرسمية وسجل التوصيل وتحديث حالته إلى «خرج للتوصيل» */
+export function completePreparationDispatch(
+  idOrNumber: string,
+  link: {
+    invoiceNumber: string;
+    deliveryOrderId: string;
+    deliveryOrderNumber: string;
+    dispatchIdempotencyKey: string;
+    assigneeType: AssigneeType;
+    assigneeId: string;
+    assigneeName: string;
+    trackingNumber?: string;
+    fee?: number;
+    feeManual?: boolean;
+    zoneId?: string;
+    zoneName?: string;
+    zoneCommission?: number;
+    notes?: string;
+  },
+  actor?: DeliveryActor,
+  now: Date = new Date()
+): DeliveryPreparationOrder {
+  const key = String(idOrNumber || '').trim();
+  const existing = preparations.find(p => p.id === key || p.number === key);
+  if (!existing) throw new DeliveryError('طلب التحضير مش موجود', 'NOT_FOUND', 404);
+
+  const invoiceNumber = text(link.invoiceNumber, 80);
+  if (!invoiceNumber) {
+    throw new DeliveryError('رقم الفاتورة مطلوب لربط طلب التحضير', 'INVOICE_NUMBER_REQUIRED', 400);
+  }
+
+  const wasAlreadyDispatched = existing.status === 'خرج للتوصيل' && existing.invoiceNumber === invoiceNumber;
+  const at = now.toISOString();
+  const by = actorName(actor);
+  const byId = String(actor?.userId || '');
+
+  existing.status = 'خرج للتوصيل';
+  if (!wasAlreadyDispatched) {
+    existing.revision += 1;
+    existing.dispatchedAt = at;
+    existing.dispatchedBy = by;
+    existing.dispatchedById = byId;
+    existing.updatedAt = at;
+    existing.updatedBy = by;
+    existing.updatedById = byId;
+  }
+  existing.invoiceNumber = invoiceNumber;
+  existing.deliveryOrderId = text(link.deliveryOrderId, 100);
+  existing.deliveryOrderNumber = text(link.deliveryOrderNumber, 60);
+  existing.dispatchIdempotencyKey = text(
+    link.dispatchIdempotencyKey || buildPreparationDispatchIdempotencyKey(existing.id),
+    120
+  );
+  existing.assigneeType = link.assigneeType;
+  existing.assigneeId = text(link.assigneeId, 100);
+  existing.assigneeName = text(link.assigneeName, MAX_NAME);
+  existing.trackingNumber =
+    link.assigneeType === 'courier' ? text(link.trackingNumber ?? existing.trackingNumber, 60) : '';
+  if (link.fee !== undefined) {
+    existing.fee = r2(link.fee);
+    if (link.feeManual !== undefined) existing.feeManual = Boolean(link.feeManual);
+    existing.estimatedTotal = r2(existing.itemsSubtotal + existing.fee);
+  }
+  if (link.zoneId !== undefined) {
+    existing.zoneId = text(link.zoneId, 100);
+    existing.zoneName = text(link.zoneName, MAX_NAME);
+    if (link.zoneCommission !== undefined) existing.zoneCommission = r2(link.zoneCommission);
+  }
+  if (link.notes !== undefined) {
+    existing.notes = text(link.notes, MAX_TEXT);
+  }
+
+  ops.doneKeys[`prep-dispatch:${existing.id}`] = existing.invoiceNumber;
+  return clonePreparationOrder(existing);
 }
 
 // ---------------------------------------------------------------------------
